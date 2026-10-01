@@ -488,10 +488,34 @@ export interface AuthenticatedApi extends RpcTarget {
   listModels(): Promise<AiChatAuthorInfo[]>;
 
   /**
-   * Adds a new model to the user's configured set. The ID must be unique among the user's
-   * configured models.
+   * Adds a new model to the user's configured set. The ID must not name a model the user already
+   * added; use `updateModel()` to replace one.
+   *
+   * `copySecretsFrom` names a hand-added model (see `getModelConfig()`) whose stored secrets fill
+   * in the `null` secrets of `config`, which is how a model is cloned without the client ever
+   * holding the secrets. The rules of `updateModel()` for keeping a secret apply to copying one.
+   * Without it, `config` must contain no `null` secrets. With it, `profile.id` must also not name
+   * a model provided by the deployment's AI Gateway configuration.
    */
-  addModel(profile: AiChatAuthorInfo, config: AiModelConfig): Promise<void>;
+  addModel(profile: AiChatAuthorInfo, config: RedactedAiModelConfig,
+           copySecretsFrom?: string): Promise<void>;
+
+  /**
+   * Gets the profile and configuration of a model the user added by hand, i.e. not one provided
+   * by the deployment's AI Gateway configuration, with its secrets withheld.
+   */
+  getModelConfig(id: string): Promise<{profile: AiChatAuthorInfo, config: RedactedAiModelConfig}>;
+
+  /**
+   * Replaces the configuration of a model the user added by hand. `profile.id` names the model,
+   * and `config.provider` and `config.model` must match the stored values.
+   *
+   * A `null` secret keeps the stored value; for a header, that of the stored header with exactly
+   * the same name. Secrets may be kept only while `config.provider` and `config.apiUrl` are
+   * unchanged, since otherwise the client could direct the stored secrets to a server it controls.
+   * Passing back what `getModelConfig()` returned therefore changes nothing.
+   */
+  updateModel(profile: AiChatAuthorInfo, config: RedactedAiModelConfig): Promise<void>;
 
   /** Deletes a configured model. */
   deleteModel(id: string): Promise<void>;
@@ -516,11 +540,16 @@ export interface AuthenticatedApi extends RpcTarget {
 
   /**
    * Get the user's preferred model, chosen during onboarding. Returns null if the user has not
-   * set a preference (or explicitly chose "No agent").
+   * set a preference (or explicitly chose "No agent"). The preference may name a model that is
+   * no longer offered (see setPreferredModel).
    */
   getPreferredModel(): Promise<string | null>;
 
-  /** Set the user's preferred model. Pass null to indicate "No agent". */
+  /**
+   * Set the user's preferred model. Pass null to indicate "No agent". Any model that resolves is
+   * accepted, including one hidden from pickers, but a new external conversation uses the
+   * preference only while it is offered, and otherwise the first offered model.
+   */
   setPreferredModel(id: string | null): Promise<void>;
 
   /** Returns true if the user has completed the onboarding wizard. */
@@ -1292,7 +1321,11 @@ export type AiModelConfig = {
   /** Name of the specific model, as specified to the provider's API. */
   model: string;
 
-  /** Secret API token for the respective provider, for billing purposes. */
+  /**
+   * Secret API token for the respective provider, for billing purposes. For providers "anthropic",
+   * "openai", and "ollama", an empty token means no key is sent at all, e.g. because a proxy
+   * authenticated through `extraHeaders` supplies its own.
+   */
   apiToken: string;
 
   /**
@@ -1307,6 +1340,42 @@ export type AiModelConfig = {
    * alternative provider that provides a compatible API.
    */
   apiUrl?: string;
+
+  /**
+   * Additional HTTP headers to send with every request to the provider, keyed by header name.
+   * These override the provider's default headers of the same name (including authentication
+   * headers), which is useful for proxies that require their own credentials. Like `apiToken`
+   * and `apiUrl`, these are ignored when the Workshop routes requests through its own AI
+   * Gateway configuration rather than contacting the provider directly.
+   */
+  extraHeaders?: Record<string, string>;
+
+  /**
+   * The maximum tokens one request may total, overriding the Workshop's built-in value for this
+   * model. Useful for a model the Workshop doesn't know, which is otherwise assumed to be small.
+   */
+  contextWindow?: number;
+
+  /**
+   * Overrides the built-in response cap for this model. Like `outputLimit` in the suggested-model
+   * table, it is both the requested response cap and the space reserved for it in the window.
+   */
+  outputLimit?: number;
+};
+
+/**
+ * An `AiModelConfig` whose secrets may be withheld, so that a stored configuration can be shown
+ * and edited without the client ever receiving its secrets. As returned by
+ * `AuthenticatedApi.getModelConfig()`, a `null` secret is a non-empty value that was withheld. As
+ * passed to `AuthenticatedApi.updateModel()` or `addModel()`, a `null` secret keeps (or copies)
+ * the stored value.
+ */
+export type RedactedAiModelConfig = Omit<AiModelConfig, "apiToken" | "extraHeaders"> & {
+  /** `AiModelConfig.apiToken`, or null if withheld. */
+  apiToken: string | null;
+
+  /** `AiModelConfig.extraHeaders`, with each value null if withheld. */
+  extraHeaders?: Record<string, string | null>;
 };
 
 /**
@@ -1331,6 +1400,12 @@ type SuggestedModel = {
    * window as the hard limit.
    */
   compactionInputBudget?: number;
+
+  /**
+   * Still resolvable for stored references, not offered in pickers. Set on models superseded by
+   * a newer one, which chats, spawners, and preferences created earlier may still name.
+   */
+  hidden?: true;
 };
 
 // The literal is kept apart from the export so SuggestedModelId can derive the model ids from it.
@@ -1354,17 +1429,23 @@ const SUGGESTED_MODEL_CATALOG = {
   },
   "anthropic": {
     "claude-opus-5-5": {name: "Claude Opus 5.5", contextWindow: 1000000},
+    "claude-sonnet-5-5": {name: "Claude Sonnet 5.5", contextWindow: 1000000},
     "claude-fable-5-1": {name: "Claude Fable 5.1", contextWindow: 1000000},
-    "claude-opus-5": {name: "Claude Opus 5", contextWindow: 1000000},
-    "claude-sonnet-5": {name: "Claude Sonnet 5", contextWindow: 1000000},
+    "claude-opus-5": {name: "Claude Opus 5", contextWindow: 1000000, hidden: true},
+    "claude-sonnet-5": {name: "Claude Sonnet 5", contextWindow: 1000000, hidden: true},
     "claude-haiku-4-5": {name: "Claude Haiku 4.5", contextWindow: 200000},
   },
   "openai": {
     // pi's GPT-6 catalog reports a 272K window, but these models support 1.05M. Use 272K as the
     // preferred compaction budget, not as the hard context limit.
+    "gpt-6.1-sol": {
+      name: "GPT-6.1 Sol", contextWindow: 1050000, outputLimit: 128000,
+      compactionInputBudget: 272000,
+    },
     "gpt-6-sol": {
       name: "GPT-6 Sol", contextWindow: 1050000, outputLimit: 128000,
       compactionInputBudget: 272000,
+      hidden: true,
     },
     "gpt-6-luna": {
       name: "GPT-6 Luna", contextWindow: 1050000, outputLimit: 128000,
@@ -1377,14 +1458,17 @@ const SUGGESTED_MODEL_CATALOG = {
     "gpt-5.6-sol": {
       name: "GPT 5.6 Sol", contextWindow: 1050000, outputLimit: 128000,
       compactionInputBudget: 272000,
+      hidden: true,
     },
     "gpt-5.6-luna": {
       name: "GPT 5.6 Luna", contextWindow: 1050000, outputLimit: 128000,
       compactionInputBudget: 272000,
+      hidden: true,
     },
     "gpt-5.6-terra": {
       name: "GPT 5.6 Terra", contextWindow: 1050000, outputLimit: 128000,
       compactionInputBudget: 272000,
+      hidden: true,
     },
   },
   "google": {
@@ -1394,7 +1478,7 @@ const SUGGESTED_MODEL_CATALOG = {
   },
 } satisfies Record<AiModelProvider, Record<string, SuggestedModel>>;
 
-/** Models offered in the picker, by provider and model id. */
+/** Models built into the Workshop, by provider and model id; pickers skip the hidden ones. */
 export const SUGGESTED_MODELS: Record<AiModelProvider, Record<string, SuggestedModel>> =
     SUGGESTED_MODEL_CATALOG;
 
@@ -2353,7 +2437,7 @@ export interface Overseer extends RpcTarget {
    * Retry the agent on the given chat. This starts the agent without adding a new user message.
    * The agent will re-process the existing chat history using the specified model.
    *
-   * If an agent is already running, this does nothing.
+   * Throws if an agent is already running on the chat.
    */
   retryAgent(chatId: number, modelId: string): Promise<void>;
 
@@ -2537,6 +2621,19 @@ export type AiChatMetadata = {
 
   /** Total cost of this conversation so far, in dollars, if known. */
   totalCost?: number;
+
+  /**
+   * Prompt tokens this conversation has sent to the model so far, including the ones the
+   * provider read from or wrote to its prompt cache, if known. A running total, like
+   * `totalCost`: compaction does not reset it.
+   */
+  promptTokens?: number;
+
+  /** How many of `promptTokens` the provider read from its prompt cache. */
+  cacheReadTokens?: number;
+
+  /** How many of `promptTokens` the provider wrote to its prompt cache. */
+  cacheWriteTokens?: number;
 
   /**
    * First sequence this chat still replays. Everything before it is covered by a compaction
