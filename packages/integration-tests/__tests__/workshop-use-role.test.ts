@@ -84,10 +84,10 @@ type UseSurface = "getMetadata" | "subscribeToMetadata" | "subscribeToPresence" 
 const DENIED_OVERSEER: Record<Exclude<keyof Overseer, keyof RpcTarget | UseSurface>,
     (ws: RpcStub<Overseer>) => unknown> = {
   setTitle: ws => ws.setTitle("Title"),
-  setPinned: ws => ws.setPinned(true),
   deleteSelf: ws => ws.deleteSelf(),
   createGadget: ws => ws.createGadget("App"),
   listTree: ws => ws.listTree(COMMIT),
+  listChangedPaths: ws => ws.listChangedPaths(COMMIT, COMMIT),
   readFilesAtCommit: ws => ws.readFilesAtCommit(COMMIT, ["client.js"]),
   getCommitLog: ws => ws.getCommitLog(COMMIT),
   submitCodeChange: ws => ws.submitCodeChange(1, {
@@ -170,6 +170,7 @@ const deniedGadget = (chatId: number): Record<
   getBlueprintAnnotation: g => g.getBlueprintAnnotation("DATA"),
   setBlueprintAnnotation: g => g.setBlueprintAnnotation("DATA", { title: "Data", description: "" }),
   createBlueprint: g => g.createBlueprint(),
+  applyBlueprint: g => g.applyBlueprint("blueprint", { modelId: null }),
 });
 
 it("a use collaborator reaches only the mainline gadget UI", async () => {

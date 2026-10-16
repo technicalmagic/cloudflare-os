@@ -1,24 +1,39 @@
 import { RpcCompatible, RpcStub, RpcTarget } from "capnweb";
 import { validateRpc } from "capnweb-validate";
-import { Overseer, GadgetMetadata, UiBundle, WorkpieceId, WorkpieceSummary, WorkpiecesSubscriber, GadgetClient, GadgetBindingInfo, GatekeeperClient, ActionState, ActionLogEntry, ActionsSubscriber, ActionHistoryFilter, ActionHistoryPage, ChatGadgetPin, ChatCodeBase, ChatGadgetPinState, CodeChangeSubmission, CommitIdentity, CommitInfo, FileAtCommit, MAX_READ_FILES_PER_CALL, TreeNode, MergeChangesResult, AiChatMetadata, AiChatMessage, AiChatHistoryPage, AiChatSubscriber, AiChatAuthorInfo, AiModelConfig, AiChatMessageBody, AgentSpawnerConfig, ConsoleLogSubscriber, ConsoleLogEvent, CapsuleSpecifier, CollaboratorInfo, CollaboratorRole, AffectedCollaborator, ShareLinkInfo, GatekeeperCreationSpec, ObserverConfigCallback, ObserverBindingNeed, ObserverBindingFailure, BlueprintBindingAnnotation, BlueprintBinding, BlueprintMetadata, BlueprintOutput, MessageFormatRef, isOutputIcon, SpawnerEnvTarget, BlueprintGadgetSummary, AiChatStreamEvent, BlueprintScreenshotUpload, BLUEPRINT_SCREENSHOT_R2_PREFIX, blueprintScreenshotUrl, ChatAttachmentUpload, ChatAttachmentHandle, ChatAttachmentRef, BoundHookInfo, PreApprovableAction, PresenceParticipant, PresenceSubscriber, SlashCommandChoice, SlashCommandRequest, validateBindingName, createOpenGadgetError, OPEN_GADGET_ERROR_CODES, resolveSiteName, actionChangeTime } from '@gadgets/workshop-shared/api';
-import { applyCodeChange, changedGadgets, codeChangeSerializedSize, composeCodeChange, diffFiles,
-  transformCodeChange, validateCodeChangeContent, validateCodeChangeSchema,
+import { Overseer, GadgetMetadata, UiBundle, WorkpieceId, WorkpieceSummary, WorkpiecesSubscriber, GadgetClient, GadgetBindingInfo, GatekeeperClient, ActionLogEntry, ActionsSubscriber, ActionHistoryFilter, ActionHistoryPage, ChatGadgetPinRecord, MainlineMergeGadget, ChatCodeBase, ChatGadgetPinState, CodeChangeSubmission, CommitInfo, FileAtCommit, MAX_READ_FILES_PER_CALL, TreeNode, MergeChangesResult, AiChatMetadata, AiChatMessage, AiChatHistoryPage, AiChatSubscriber, AiChatAuthorInfo, AiModelConfig, AiToolCall, AiChatMessageBody, AgentSpawnerConfig, ConsoleLogSubscriber, ConsoleLogEvent, CapsuleSpecifier, CollaboratorInfo, CollaboratorRole, AffectedCollaborator, ShareLinkInfo, GatekeeperCreationSpec, ObserverConfigCallback, ObserverBindingNeed, ObserverBindingFailure, BlueprintBindingAnnotation, BlueprintBinding, BlueprintMetadata, BlueprintOutput, BlueprintMerge, ApplyBlueprintResult, GadgetUpstream, MessageFormatRef, isOutputIcon, SpawnerEnvTarget, BlueprintGadgetSummary, AiChatStreamEvent, BlueprintScreenshotUpload, BLUEPRINT_SCREENSHOT_R2_PREFIX, blueprintScreenshotUrl, ChatAttachmentUpload, ChatAttachmentHandle, ChatAttachmentRef, BoundHookInfo, PreApprovableAction, PresenceParticipant, PresenceSubscriber, SlashCommandChoice, SlashCommandRequest, validateBindingName, createOpenGadgetError, OPEN_GADGET_ERROR_CODES, resolveSiteName, modelKind } from '@gadgets/workshop-shared/api'
+import { applyCodeChange, changedGadgets, codeChangeSerializedSize, composeCodeChange,
+  MAX_CODE_CHANGE_SIZE, transformCodeChange, validateCodeChangeContent, validateCodeChangeSchema,
   type CodeContent, type CodeChange } from "@gadgets/workshop-shared/code-change";
-import { type AgentCatalog, Gatekeeper, HookInitiator, ResourceDescription, ApprovalQueue, ActionDescription, ObservationAuthorizer, ObservationDescription, VendorDescription, SupportedResource, resolveRequestedResource, HookController, HookDescription, ActionKind, GitCache, GitPullHints } from "@gadgets/workshop-shared/gatekeeper";
+import { type AgentCatalog, Gatekeeper, GatekeeperUserVerifier, HookInitiator, ResourceDescription, ApprovalQueue, ActionDescription, ObservationAuthorizer, ObservationDescription, VendorDescription, SupportedResource, resolveRequestedResource, HookController, HookDescription, ActionKind, GitCache, GitPullHints } from "@gadgets/workshop-shared/gatekeeper";
 import {
   DurableObject, WorkerEntrypoint, RpcStub as NativeRpcStub,
   RpcTarget as NativeRpcTarget, restore,
 } from "cloudflare:workers";
-import { createTypedStorage, collection, singleton, keyString } from "@gadgets/typed-storage";
+import { keyString } from "@gadgets/typed-storage";
 import type { ListOptions } from "@gadgets/typed-storage";
-import { GitStore, commitIdentityForAuthor, filesEqual, gitObjectsCollection, threeWayMerge }
-  from "./git-store";
-import { GitCacheImpl, WorkspaceGitCache, gitObjectMetadataCollection } from "./git-cache";
-import { migrateCodeLogToGit } from "./git-migration";
-import * as Y from "yjs";
+import {
+  actionLastChangedKey, chatChangeClientKey, chatKey, chatKeyPrefix, makeOverseerStorage,
+  type ActionRecord, type ActiveAgentRecord, type AgentSpawnerBindingProps,
+  type AiChatAgentContext, type BindingRecord,
+  type BlueprintGadgetRecord, type BoundHookRecord, type ChatBindingEntry,
+  type ChatChangeBoundaryRecord, type ChatChangeRecord, type CompactionCheckpoint,
+  type ExternalChatRecord, type ExternalMessageRecord, type GadgetRecord, type GatekeeperCaller,
+  type GatekeeperClass, type GatekeeperRecord, type ObserverRecord, type OverseerStorage,
+  type StoredAssistantMessage, type StoredChatMessage, type StoredChatMetadata,
+  type WorkpieceRecord, type WorktreeRecord,
+} from "./storage-schema/overseer-storage";
+import type { UserAiModelRecord, WorkspaceOutputEntry } from "./storage-schema/user-storage";
+import {
+  GitStore, commitIdentityForAuthor, filesEqual, threeWayMerge, type MergeResult,
+} from "./git-store";
+import { GitCacheImpl, WorkspaceGitCache } from "./git-cache";
+import {
+  OVERSEER_STORAGE_VERSION, migrateToActionIndexes, migrateToBlueprintUpstreams,
+  migrateToGitStorage, migrateToMultiGadget, migrateToWorkpieceTypes,
+} from "./storage-schema/overseer-migrations";
 import type { Usage } from "@earendil-works/pi-ai";
 import {
-  LanguageModelGatekeeperProps,
+  AiModelGatekeeperProps,
   getModel,
   UserGatewayRouting,
 } from "./ai-models";
@@ -29,17 +44,27 @@ import {
   getAiGatewayLogCost,
   type AiGatewayLogRoute,
 } from "./ai-gateway";
-import { AgentGadgetInfo, AgentHooks, AiChatAgentContext, CHAT_CHANGE_MESSAGE_BUDGET, ChatBindingEntry, SeedBindingInfo, runAgent, summarizeArgs, type AgentStepChange, type AiChatMessageBodyWithModelData, type ChatHistory, type CompactionCheckpoint, type StoredAssistantMessage, type WorktreeTurnAccess, GIT_BINDING_NAME } from "./agent";
+import { AgentGadgetInfo, AgentHooks, SeedBindingInfo, agentCodeChangeShape, alwaysAvailableResources, formatMissingBlueprintBindings, runAgent, summarizeArgs, type AgentStepChange, type AiChatMessageBodyWithModelData, type ChatHistory, type WorktreeTurnAccess, GIT_BINDING_NAME } from "./agent";
 import { WorktreeSessionImpl } from "./worktree-session";
 import { GitImpl } from "./git-binding";
 import { scanWorkpieceForGrep, type GrepScan } from "./grep";
 import WORKTREE_BINDING_TYPES from "./worktree-binding.txt";
 import { deploymentOutputForBlueprint, FormatOffer, listFormatOffers, readAdminConfig } from "./admin-config";
-import { chatChangeStatuses, foldProposedChanges, type ChangeBatch } from "./agent-compaction";
+import { chatChangeStatuses, foldCompactedCode } from "./agent-compaction";
 import { ambientGatekeeperMode } from "./provisioning-policy";
-import { listFeaturedBlueprintsFromKv, readBlueprintContent, readBlueprintKvRecord, sanitizeBlueprintOutput } from "./blueprint-archive";
+import {
+  blueprintContentKey, deleteBlueprintContent, readBlueprintRelease, sanitizeBlueprintOutput,
+} from "./blueprint-archive";
+import {
+  buildReleasePack, buildSnapshotRelease, encodeReleaseCommit, releaseMergeHeader,
+  releasesMergedBy, type Release,
+} from "./blueprint-release";
+import { encodeGitTree, gitObjectOid, parseGitCommitRefs } from "./git-codec";
+import {
+  listFeaturedBlueprintsFromKv, readBlueprintKvRecord, type BlueprintKvRecord,
+} from "./storage-schema/blueprints-kv";
 import { WebFetchEnv } from "./web-fetch";
-import { UserDurableObject, UserAiModelRecord, type UserChatContext, type WorkspaceOutputEntry } from "./user";
+import { UserDurableObject, type UserChatContext } from "./user";
 import type { AgentSpawnerBinding, CallableAgent, SpawnCallableOptions } from "./agent-spawner-binding";
 import { recordAnalytics } from "./analytics";
 import { reportIssue } from "@gadgets/observability/error-reporting";
@@ -47,15 +72,14 @@ import type { ProductAnalyticsConnectionType, ProductAnalyticsGadgetInput } from
 import { checkUsageAndBalance } from "./ai-gateway-billing/limits/usage-checker";
 import { normalizeAgentCatalog } from "./agent-catalog";
 import { refreshCachedBalance } from "./ai-gateway-billing/cloudflare/connection-service";
-import { SharingManager, SharingCaller, CollaboratorRecord, ShareKeyRecord, roleRank }
-    from "./sharing";
+import { SharingManager, SharingCaller, roleRank } from "./sharing";
 import { AutoApprovalDrainer, autoApprovalRule } from "./auto-approval";
 import { collectSlashCommands, invokeSlashCommand } from "./slash-commands";
 import { createWorkshopLogger, obsContext } from "./observability";
 import { traceAgentTurn, traceToolApproval } from "./agent-tracing";
-import { retryOnDoReset, wrapDoStubForTelemetry } from "./do-retry";
+import { isLoopLimitError, retryOnDoReset, wrapDoStubForTelemetry } from "./do-retry";
 import type { ChatGatewayRpcTarget, SubmitExternalMessageResult } from "@gadgets/workshop-shared/external-message-gateway";
-import type { GadgetExportFormat } from "@gadgets/workshop-shared/api";
+import type { CreationApproval, GadgetExportFormat } from "@gadgets/workshop-shared/api";
 import {
   assertChatAttachmentSupportedByProvider,
   isAllowedChatAttachmentImageMimeType,
@@ -218,242 +242,20 @@ type PreparedChatMessage = {
   skillName?: string;
 };
 
-// A call made on a callable agent (the `self` object or a spawnCallable() stub) that has not yet
-// been appended to its chat log. See the `pendingAgentCalls` collection.
-type PendingAgentCallRecord = {
-  chatId: number;
-  callId: number;             // from the nextAgentCallId singleton; the key is chatId.callId
-  methodName: string;
-  args: unknown[];            // must be storable: any RPC stubs among them are persistent stubs
-  argsSummary: string;        // depth-limited summary string (see summarizeArgs)
-  initiatorUserId: string;    // hex durable object ID of user DO
-  initiatorModelId: string | null;  // null when the spawner has no model (see spawnAgent)
-};
-
-type GatekeeperClass = DurableObjectClass<Gatekeeper<any>>;
-
 // getAgentCatalog is optional on Gatekeeper; ambient capsules always implement it. After confirming
 // the gatekeeper is an ambient capsule, we view its facet through this derived (Pick + Required)
 // shape to call it — same optional-method-on-a-stub pattern as user.ts's SingletonAccountStub.
 type CatalogGatekeeperFacet =
     Fetcher<Gatekeeper<any> & Required<Pick<Gatekeeper<any>, "getAgentCatalog">>>;
 
-type LegacyBlueprintBindingAnnotation = BlueprintBindingAnnotation & {
-  included?: boolean;
-};
-
 function defaultBlueprintBindingTitle(record: GatekeeperRecord, bindingName?: string): string {
   return record.resourceTitle || bindingName || "Connection";
 }
-
-// Storage key of a chat's compaction checkpoint. See the `chatCompactions` collection.
-function compactionKey(chatId: number, compactedTo: number): string {
-  return `${keyString(chatId)}.${keyString(compactedTo)}`;
-}
-
-// A gatekeeper (connection) workpiece. IDs are allocated from the shared workpiece counter (see
-// the `nextGatekeeperId` singleton), so they never collide with gadget IDs.
-type GatekeeperRecord = {
-  id: WorkpieceId;
-  resourceTitle?: string,   // denormalized to avoid gatekeeper query
-  resourceUrl?: string;     // denormalized to avoid gatekeeper query
-  hasSlashCommands?: true;  // denormalized from ResourceDescription
-  class: GatekeeperClass,
-  hook?: string,  // export name to which the gatekeeper's hook is connected
-
-  // Records how this gatekeeper was originally created, enabling blueprint metadata derivation.
-  creationSpec?: GatekeeperCreationSpec;
-
-  // OBSOLETE: Before we had support for multiple gadgets per workspace, the binding name and
-  // blueprint annotation information lived on the GatekeeperRecord. These properties continue
-  // to be declared only to support migrating them away. The version 0 -> 1 migration copies
-  // these into `GadgetRecord.bindings` for the default gadget. (A later migration may delete the
-  // originals, or they may just be left around, but if so they are stale.)
-  bindingName?: string;
-  blueprintAnnotation?: BlueprintBindingAnnotation;
-};
 
 function gatekeeperVendorId(record: GatekeeperRecord | undefined): string | undefined {
   let spec = record?.creationSpec;
   return spec && "vendorId" in spec ? spec.vendorId.toLowerCase() : undefined;
 }
-
-// A binding edge from one gadget to a target workpiece (today always a gatekeeper), stored in
-// GadgetRecord.bindings keyed by binding name.
-type BindingRecord = {
-  target: WorkpieceId;
-
-  // User-provided metadata for how this binding should appear in blueprints. Absence means not
-  // yet configured. This lives on the edge, not on the gatekeeper: two gadgets binding the same
-  // gatekeeper can annotate it differently for their respective blueprints.
-  blueprintAnnotation?: BlueprintBindingAnnotation;
-
-  // Present while the binding edge is provisional: it was added within the given chat and
-  // follows that chat's accept/reject lifecycle exactly like code changes and gadget creations
-  // (see GadgetRecord.pending, whose stamping and crash-recovery mechanics this mirrors
-  // edge-for-edge via the "changes" message's `addedBindings`). A pending edge is real in the
-  // registry so the originating chat's own preview/test runs see it, but for *reads* everything
-  // else (mainline loads, other chats, blueprints, "use"-role sharing) treats it as nonexistent.
-  // For *writes* it still occupies its name: another chat attempting to add the same name on
-  // this gadget fails with an explicit error until this chat's changes are accepted or reverted.
-  pending?: {chatId: number, sequence?: number};
-};
-
-/**
- * A gadget workpiece (one variant of WorkpieceRecord, below). IDs are allocated from the shared
- * workpiece counter (see the `nextGatekeeperId` singleton), so they never collide with
- * gatekeeper or worktree IDs -- in particular the facet names `gadget${id}` and
- * `gatekeeper${id}` can never collide either.
- */
-export type GadgetRecord = {
-  type: "gadget";
-  id: WorkpieceId;
-  title: string;
-  created: Date;
-
-  /**
-   * The output format this gadget was built as, copied from the blueprint it was instantiated
-   * from (see BlueprintMetadata.output). Absent for a gadget built from scratch, which displays as
-   * a generic app. Purely descriptive: it names and draws the gadget, and confers nothing.
-   */
-  output?: BlueprintOutput;
-
-  /**
-   * Name of the gadget to use in the workspace's default binding list for new chats. That is, when
-   * a new (normal, non-spawner) chat is started, this gadget will be available in its `env` under
-   * this name from the start. The name is typically chosen at creation time (an argument to the
-   * agent's createGadget tool). Gadgets which are still pending (`pending` is present) are
-   * omitted from the default binding list, but still have `bindindName` set so that they claim the
-   * name in the unique index, preventing awkward conflicts if two chats were to try to create the
-   * same-named gadget provisionally at the same time.
-   */
-  bindingName: string;
-
-  /**
-   * The gadget's head commit (40-hex oid) in the workspace's git object store -- its committed
-   * mainline code (see git-store.ts and the `gitObjects` collection). This field is the gadget's
-   * "ref": the store itself has no ref layer. It advances only in mergeChanges(), which requires
-   * the accepting chat to have already merged this commit (accepts are fast-forward only), and is
-   * surfaced to clients as WorkpieceSummary.commitId.
-   *
-   * Invariant: **every permanent gadget has a head**; `commitId` is absent only while the gadget
-   * is `pending` (its files exist only in the creating chat's proposed changes, and only that
-   * chat can promote it). A gadget with no code gets an *empty-tree* initial commit -- at
-   * permanent creation (createGadget with no chatId, blueprint instantiation) or synthesized by
-   * the git migration -- so there is always a commit for a chat's first edit to pin, and
-   * "rooted at nothing" is representable as an ordinary pin at the empty tree rather than as
-   * unpinned doc content, which nothing could safely reconcile once another chat's accept moved
-   * the head. Accepting a covered creation likewise always writes a first commit (an empty tree
-   * when the gadget has no files yet), so promotion establishes the invariant too.
-   */
-  commitId?: string;
-
-  /**
-   * This gadget's bindings: binding name (as it appears in the gadget worker's `env`) -> binding
-   * edge. Expected to stay small, so it's a map on the record rather than a separate collection.
-   */
-  bindings: Record<string, BindingRecord>;
-
-  /**
-   * Present while the gadget is provisional: it was created within the given chat and follows
-   * that chat's accept/reject lifecycle exactly like code changes (see mergeChanges() /
-   * revertChanges()). `sequence` is the chat-log sequence of the "changes" message whose
-   * `createdGadgets` records the creation; it is stamped in the same transaction that persists
-   * the message (the step's barrier), so the log and the registry can never disagree. An
-   * unstamped record means the creating step hasn't reached its barrier yet: normally that step
-   * is still running, but after a mid-step crash the record may linger -- backed by nothing,
-   * since the step's message is by construction lost -- and is reaped (see
-   * reconcilePendingGadgets()). The chat log is the source of truth; this record materializes
-   * it so the gadget is fully functional (bindings, facet, env) before acceptance.
-   */
-  pending?: {chatId: number, sequence?: number};
-};
-
-/**
- * A worktree workpiece (the other variant of WorkpieceRecord): a file tree rooted at a git
- * commit, created by an agent's createWorktree tool and private to the chat that created it.
- * The agent reads and edits its files with the regular file tools -- its edits ride the chat's
- * ordinary change stream, pinned on first modification like a gadget's (see `pinBase`) -- but
- * it has no output, no bindings, no facet, and never executes. Clients see it as a
- * WorktreeSummary on build-role workpiece subscriptions (see subscribeToWorkpieces) and read its
- * content lazily, by commit and path (see listTree / readFilesAtCommit); its change-stream
- * entries and pins are delivered like a gadget's.
- */
-export type WorktreeRecord = {
-  type: "worktree";
-  id: WorkpieceId;
-  title: string;
-  created: Date;
-
-  /**
-   * The chat this worktree belongs to. Permanent (never cleared): this is what keeps the
-   * worktree chat-private for its whole life, independent of the `pending` lifecycle below --
-   * acceptance makes the *record* permanent, not the worktree visible elsewhere. The worktree is
-   * deleted with its chat.
-   */
-  chatId: number;
-
-  /**
-   * The gatekeeper (connection) the base commit was known from at creation time, when there was
-   * one -- purely informational (pull routing uses the per-oid `gitObjectMetadata` sources, not
-   * this). Absent for a worktree created from a purely local commit (e.g. gadget history).
-   */
-  sourceGatekeeperId?: WorkpieceId;
-
-  /**
-   * The commit the worktree was created at. Immutable.
-   */
-  baseCommit: string;
-
-  /**
-   * The last *explicit* commit (initially baseCommit): what the worktree API reports as HEAD and
-   * what explicit commits parent on. Not advanced in this change -- the Worktree binding API's
-   * commit() lands separately -- but stored from birth so the record shape is final.
-   */
-  headCommit: string;
-
-  /**
-   * The accepted commit (initially baseCommit): the worktree's content as of the chat's last
-   * accept, and the worktree analog of a gadget's head. An unpinned worktree reads as this
-   * commit's tree; the epoch's first modification -- a write, or a commit() -- pins the worktree
-   * in the chat at exactly this commit (so a chat pin, when present, always has
-   * `baseCommit === pinBase`), and the epoch's OT rows compose on it. Advanced only by epoch
-   * resets, to the accept's auto-commit of the dirty overlay (never by explicit commits --
-   * moving it mid-epoch would double-apply the still-live rows on replay). Published as
-   * WorktreeSummary.pinBase: the commit the UI reads an unpinned worktree from, and the base a
-   * client's pin declaration must name.
-   */
-  pinBase: string;
-
-  /**
-   * Never set: a worktree has no workspace-level binding name -- the name it was created under
-   * lives only in its chat's binding map, so two chats can each have a worktree named `REPO`.
-   * Declared (as optional-and-undefined) so the unified byBindingName index function can read
-   * `record.bindingName ?? null` across the union, which also keeps the index keys of pre-v4
-   * rows -- whose `type` discriminant is not yet stamped -- correct during the migration window.
-   */
-  bindingName?: undefined;
-
-  /**
-   * Set only between creation and the "changes" message that records it (via
-   * `createdWorktrees`), which clears it in the same write: an unstamped record whose chat has
-   * no active turn is a crash orphan, reaped by reconcilePendingGadgets like an unstamped
-   * gadget. Unlike GadgetRecord.pending, it is never stamped for a later accept or revert to
-   * decide on, because creating a worktree proposes nothing (see proposedChangeWorkpieceIds):
-   * once recorded, the worktree lives as long as its chat, and a revert covering the creation
-   * rolls back its content and head but never deletes it. `sequence` appears only on records
-   * written before this was so; reconcilePendingGadgets promotes those.
-   */
-  pending?: {chatId: number, sequence?: number};
-};
-
-/**
- * The unified workpiece registry record: the `gadgets` collection (named before worktrees
- * existed) stores both variants, discriminated by `type`. One table so a WorkpieceId resolves
- * in one lookup and content-handling code can be shared; rows written before schema version 4
- * lack the discriminant on disk and are stamped `type: "gadget"` by #migrateToWorkpieceTypes.
- */
-export type WorkpieceRecord = GadgetRecord | WorktreeRecord;
 
 // Produce a valid, unused binding name from a suggested base name: sanitized to identifier
 // characters (uppercased, in keeping with the ALL_CAPS convention), then suffixed _2/_3/...
@@ -526,28 +328,6 @@ function oneLineReason(reason: string): string {
   return reason.replace(/\p{Cc}/gu, " ").replace(/\s+/g, " ").trim();
 }
 
-// Storage record describing a non-owner collaborator who has configured their gatekeeper accounts
-// and passed all `addObserver` checks -- i.e. is actually set up to observe data the Gadget has
-// read. This is distinct from the sharing table (which records the owner's *intent* that a user
-// have access): opening requires BOTH a reachable role in the sharing graph AND a complete
-// observer record. See observers-implementation-plan.md §3.
-type ObserverRecord = {
-  // The sharing-table key for this user (their profile.id). Primary key of the collection.
-  profileId: string;
-
-  // Random, opaque, stable-for-this-record handle passed to gatekeepers as `addObserver`'s `id`.
-  // We deliberately do NOT use profileId here, to avoid tempting gatekeeper authors to parse
-  // identity out of it -- identity is conveyed only via the verifier. The id need not survive
-  // removal/re-add: a user who loses and regains access gets a fresh record and a fresh id.
-  observerId: string;
-
-  // The account the user chose to satisfy each in-scope gatekeeper binding, remembered so they are
-  // not asked again. Keyed by gatekeeper id (GatekeeperRecord.id). The accountId refers to a
-  // ConnectedAccountRecord in THIS user's own User DO. An entry records only that choice -- it
-  // asserts nothing about whether the gatekeeper still admits them, which every open re-checks.
-  accountChoices: { [gatekeeperId: number]: number };
-};
-
 function connectionTypeFromCreationSpec(
     type: GatekeeperCreationSpec["type"] | undefined): ProductAnalyticsConnectionType | undefined {
   switch (type) {
@@ -558,37 +338,6 @@ function connectionTypeFromCreationSpec(
     case undefined: return undefined;
   }
 }
-
-// Blueprint record stored in the Overseer DO's `blueprints` collection.
-type BlueprintGadgetRecord = {
-  id: string;
-  metadata: BlueprintMetadata;
-
-  // Which gadget this blueprint exports. If omitted, use `defaultGadgetId`.
-  gadgetId?: WorkpieceId;
-
-  // The commit (in the workspace's git object store) whose tree was exported into this
-  // blueprint. Every record written since git-backed code storage carries it (a blueprint of a
-  // gadget with no committed code cannot be created); absent only on records written before,
-  // which carry `codeVersion` instead until the migration converts them.
-  commitId?: string;
-
-  // Legacy (pre-git-storage): version of the workspace code (from the read-only `code`
-  // collection) that was exported into this blueprint. Superseded by `commitId`; retained so
-  // old records stay interpretable until the migration rewrites them.
-  codeVersion?: number;
-
-  // Set true before propagating to User DO / KV; cleared on success.
-  // If persistently true, the UI should show a retry indicator.
-  dirty?: boolean;
-};
-
-// KV record type for the BLUEPRINTS namespace.
-type BlueprintKvRecord = {
-  metadata: BlueprintMetadata;
-  ownerId: string;
-  gadgetId: string;
-};
 
 // The agent-facing section of the worktree binding's type definitions: worktree-binding.txt is
 // a symlink to worktree-binding.d.ts shipped as a text module (the agent-spawner-binding.txt
@@ -604,7 +353,7 @@ function worktreeAgentApiText(): string {
 function describeBindingKind(binding: BlueprintBinding): string {
   switch (binding.type) {
     case "gatekeeper": return `external resource: ${binding.gatekeeperName}`;
-    case "aiModel": return `AI model`;
+    case "aiModel": return binding.modelKind === "decision" ? `AI decision model` : `AI model`;
     case "agentSpawner": return `agent spawner`;
     default: return binding satisfies never;
   }
@@ -632,249 +381,12 @@ function validateChatAttachmentId(id: string): string {
   return id;
 }
 
-type ChatAttachmentContentRecord = {
-  fileId: string;
-  data: Uint8Array;
-  state:
-    | {
-        type: "staged";
-        uploadedAt: number;
-        mimeType: string;
-        name?: string;
-      }
-    | {
-        type: "committed";
-        chatId: number;
-      };
-};
-
 // Sentinel gatekeeperId used on ActionRecords that originated from built-in agent tools
 // (e.g. webFetch) rather than from a real gatekeeper. Real gatekeeper IDs are assigned
 // starting at 1, so -1 is a safe out-of-band marker. Only "observation" records ever carry
 // this value; observations never go through the approve/reject paths that would dereference
 // the gatekeeper, so no lookup is ever attempted.
 const BUILTIN_TOOL_GATEKEEPER_ID = -1;
-
-export type ActionRecord = {
-  id: number,
-  gatekeeperId: WorkpieceId;
-  caller: GatekeeperCaller;
-  resourceTitle?: string;   // denormalized to avoid gatekeeper query
-  resourceUrl?: string;     // denormalized to avoid gatekeeper query
-  createdAt: Date;
-
-  /**
-   * When the record last changed state: an action's approval/rejection, a hook's enable/disable
-   * toggle or deletion. Absent while nothing has happened since creation (and on legacy records
-   * from before it was tracked).
-   */
-  appliedAt?: Date;
-
-  state: ActionState;
-
-  /**
-   * OBSOLETE: May still be present in records written when there was only one gadget per
-   * workspace. Ignore; use `resourceTitle` for display instead.
-   */
-  bindingName?: string;
-} & ({
-  type: "action";
-  action: number;  // action key assigned by the gatekeeper, passed back on apply/reject/revert
-  description: ActionDescription;
-  resolvedBy?: AiChatAuthorInfo;  // set when resolved (approved/rejected); absent while pending (or legacy)
-  autoApproved?: boolean;         // set when applied by an auto-approval rule rather than a human
-} | {
-  type: "observation";
-  description: ObservationDescription;
-} | {
-  type: "bindHook";
-
-  /** Denormalized so that the log is coherent even after the hook itself has been deleted. */
-  description: HookDescription;
-
-  /**
-   * Binding a hook is treated as an action in the log for the purpose of logging that the hook
-   * was created, but hooks are also independently long-lived entities that live in their own
-   * table. `hookId` is a reference into the bound hooks table.
-   *
-   * This becomes `undefined` if the hook was later deleted.
-   */
-  hookId?: number;
-
-  /** Denormalized for display purposes. */
-  enabled: boolean;
-});
-
-type BoundHookRecord = {
-  id: number;
-  actionId: number;
-  gatekeeperId: WorkpieceId;
-
-  // The gadget whose code this hook wakes. Bookkeeping only -- used to display which gadget a
-  // hook belongs to and to delete a gadget's hooks when the gadget is deleted. Operationally the
-  // `callback` already encapsulates OverseerRestoreParams pointing at the correct gadget.
-  // If omitted, use `defaultGadgetId`.
-  gadgetId?: WorkpieceId;
-
-  vendorId?: string;
-  controller: Fetcher<HookController<RpcTarget>>;
-  callback: NativeRpcStub<RpcTarget>;
-  description: HookDescription;
-  enabled: boolean;
-};
-
-// READ-ONLY LEGACY: one pre-git-storage live draft edit (a Yjs V2 update). Nothing writes or
-// reads these anymore -- uncommitted changes are `chatChanges` rows -- but pre-conversion chats
-// may still hold stored drafts, which the git-storage migration folds into each chat's conversion
-// change and then deletes.
-type ChatDraftUpdateRecord = {
-  chatId: number;
-  timestamp: Date;
-  author: AiChatAuthorInfo;
-  update: Uint8Array;
-};
-
-/**
- * One accepted row of a chat's code-change stream: the uncommitted-changes representation (see
- * ChatCodeBase in the API). Every producer's change -- a user submitCodeChange(), an agent tool
- * edit, an updateChatFromMainline() merge -- becomes one row, numbered by a per-generation
- * revision counter and broadcast to subscribers as `changeApplied`. Rows are periodically
- * *materialized* into a durable "changes" message (see materializeChatChanges): the message's
- * `change` re-records their composition and its `watermark` names the rows it absorbed.
- */
-type ChatChangeRecord = {
-  chatId: number;
-
-  /**
-   * The generation of the chat's change stream this row belongs to (see ChatCodeBase.generation).
-   */
-  generation: number;
-
-  /** 1-based revision within `generation`; rows are contiguous by construction. */
-  revision: number;
-
-  timestamp: Date;
-  author: AiChatAuthorInfo;
-  change: CodeChange;
-
-  /** The submission echo for user rows (see AiChatSubscriber.changeApplied); absent otherwise. */
-  submission?: {clientId: string, seq: number};
-
-  /**
-   * Set when the row is no longer live: a "changes" message has materialized it (its change is part
-   * of the message), or its generation was closed by a merge's epoch reset. Retired rows are
-   * excluded from content folds and from subscribe-replay; they are retained briefly as a pure
-   * transform window -- the grace buffer late submissions (including the straggler bridge)
-   * transform across -- and expire lazily by age (see CHAT_CHANGE_RETIRED_TTL_MS).
-   */
-  retired?: true;
-};
-
-/**
- * Per (user, client editing session) submission-dedupe record (see Overseer.submitCodeChange): the
- * last accepted seq, where it landed, and a digest of the submission, updated in place at each
- * accept. Lives outside the rows so recognition survives materialization, epoch resets, and
- * destructive bumps; never pruned (an expired record would let a sufficiently delayed retry of
- * a session's first change re-apply as a fresh `seq: 1`), deleted only with the chat.
- */
-type ChatChangeClientRecord = {
-  chatId: number;
-
-  /** The submitting user's User DO id: records are scoped to the authenticated user. */
-  userId: string;
-
-  /** The client-minted session token (validated against CHAT_CHANGE_CLIENT_ID_PATTERN). */
-  clientId: string;
-
-  /** The last accepted submission's seq. */
-  seq: number;
-
-  /** Where the last accepted submission landed. */
-  generation: number;
-  revision: number;
-
-  /**
-   * SHA-256 (64-hex) of the accepted submission's serialized content. A same-seq retry must
-   * match it byte-for-byte: acknowledging different content as "already applied" would silently
-   * strand a change the server never ran.
-   */
-  digest: string;
-};
-
-/**
- * The straggler bridge's record of a chat's most recent content-preserving generation close (a
- * merge's epoch reset; see Overseer.submitCodeChange and ChatCodeBase.prior). Destructive bumps
- * delete it -- their closed stream is not bridgeable.
- */
-type ChatChangeBoundaryRecord = {
-  chatId: number;
-
-  /** The closed generation (equals ChatCodeBase.prior.generation while the bridge is open). */
-  generation: number;
-
-  /** The closed generation's terminal revision. */
-  finalRevision: number;
-
-  /**
-   * Per-gadget boundary: the commit whose tree equals the gadget's chat content at the reset --
-   * the merge's commit for a committed gadget, or head-at-reset for a pin that evaporated with
-   * no net change while `mergedCommit` equaled head -- or null when the reset visibly changed
-   * the gadget's content (bridge-ineligible; mirrored in ChatCodeBase.prior.discontinuousGadgets).
-   * Bridged changes' pins derive from these commits, never from the client's declarations.
-   */
-  boundaries: {gadgetId: WorkpieceId, commitId: string | null}[];
-};
-
-/** A user opt-in to auto-approve actions carrying a given `actionKind` on a given gatekeeper */
-export type AutoApproveTagRecord = {
-  gatekeeperId: WorkpieceId;
-  /**
-   * The action kind (stable tag + display label, from ActionDescription.actionKind), captured when
-   * the rule was enabled so the rule can be listed without showing the raw machine tag.
-   */
-  actionKind: ActionKind;
-  /**
-   * Who turned this rule on. Auto-approvals run under this user's authority, so each auto-applied
-   * action is attributed to them in the audit log.
-   */
-  enabledBy: AiChatAuthorInfo;
-};
-
-// Server-only record describing an in-progress agent turn, enabling resumption after a server
-// restart. Keyed by chatId. A record is present (mirroring `chatMeta.activeAgent`) for exactly as
-// long as an agent turn is, or should be, running. On startup, the set of these records identifies
-// which agents were interrupted by a restart and need to be resumed.
-//
-// Note we deliberately do NOT store the resolved `AiModelConfig` here, because it contains a secret
-// API token. Instead we store enough to re-fetch it from the initiator's user DO on resume.
-
-// External message gateways pass a response target when submitting a prompt. While the agent turn is
-// in progress, `waiting` records persist that target across DO eviction/restart; once response
-// text is known, `ready` records retry delivery until acknowledged; `delivered` records are
-// retained briefly so retries of the same external message remain idempotent.
-type ExternalMessageRecord = {
-  // Namespaced external message key used to dedupe retries of the same submission.
-  idempotencyKey: string;
-  chatId: number;
-  // Chat log sequence number of the external prompt. The target sends the latest agent/error
-  // response after this sequence, stopping before the next user message.
-  promptSequence: number;
-  createdAt: number;
-} & (
-  | {
-      status: "waiting";
-      chatGatewayRpcTarget: NativeRpcStub<ChatGatewayRpcTarget>;
-    }
-  | {
-      status: "ready";
-      chatGatewayRpcTarget: NativeRpcStub<ChatGatewayRpcTarget>;
-      responseText: string;
-    }
-  | {
-      status: "delivered";
-      deliveredAt: number;
-    }
-);
 
 type ExternalMessageResponseTargetRegistration = {
   idempotencyKey: string;
@@ -899,38 +411,6 @@ type ExternalMessageSubmitInput = {
   title: string;
 };
 
-type ExternalChatRecord = {
-  externalChatKey: string;
-  chatId: number;
-};
-
-type ActiveAgentRecord = {
-  chatId: number;
-  // Hex durable object ID of the initiator's user DO, used to re-resolve the model config and for
-  // billing.
-  initiatorUserId: string;
-  // Model ID, used to re-resolve the model config (matches `chatMeta.activeAgent.id`).
-  modelId: string;
-  // Who initiated this turn (a user, or a gadget for spawner/callback turns).
-  initiator: AiChatAuthorInfo;
-  // Whether this turn was initiated by a gadget callback (vs. a chat message).
-  callbackInitiated: boolean;
-};
-
-// One agent step's model-facing snapshot (see StoredAssistantMessage in agent.ts), keyed by the
-// chatId.sequence of the step's "message" record.
-type ChatModelDataRecord = {
-  chatId: number;
-  sequence: number;
-  message: StoredAssistantMessage;
-};
-
-// A stored chat metadata row. Rows written before proposed-ness became derived (see
-// Overseer.proposedChangeWorkpieceIds) carried a cached `hasProposedChanges` flag; nothing
-// writes or reads it anymore, but old rows still hold stale values, so the stored shape admits
-// it and chatMetaForClient strips it from deliveries.
-type StoredChatMetadata = AiChatMetadata & {hasProposedChanges?: boolean};
-
 // If live change rows exist whose newest author differs from a new submission's author and the
 // stream has been idle this long, the older author's rows are materialized into their own
 // "changes" message first, keeping attribution per author (see submitCodeChange).
@@ -940,7 +420,7 @@ const CHAT_CHANGE_AUTHOR_SPLIT_MS = 60_000;
 // so a long editing session can't grow the window (and its subscribe-replay cost) without bound.
 // The job is compacting keystroke-granularity ops into few large composed ops -- rows arrive
 // per edit burst, so this is sized in "a screenful of typing", not lines. Byte growth is
-// bounded separately (CHAT_CHANGE_MESSAGE_BUDGET, enforced at row-append time). Thanks to the
+// bounded separately (MAX_CODE_CHANGE_SIZE, enforced at row-append time). Thanks to the
 // retired-row grace window this stales nobody: a submission based inside the materialized range
 // still transforms over the retired rows.
 const CHAT_CHANGE_MATERIALIZE_THRESHOLD = 1000;
@@ -960,6 +440,18 @@ const AGENT_RESPONSE_DELIVERED_RETENTION_MS = 24 * 60 * 60 * 1000;
 // How long after agent work becomes outstanding (a turn starts, or a call to a callable agent is
 // recorded) the keep-alive alarm fires. See #agentKeepAliveTime.
 const AGENT_KEEPALIVE_ALARM_MS = 60_000;
+
+// How old a workspace instance must be before a loop-limit rejection restarts it. See
+// OverseerImpl.restartIfLoopLimited.
+const LOOP_LIMIT_RESTART_MIN_AGE_MS = 60_000;
+
+// The error an accept throws when writing a workpiece's commit fails (most likely because
+// storage refused a file too large to hold, which the git store's error names), prefixed with
+// the workpiece as the user knows it. An accept writes its objects before it moves anything, so
+// the chat keeps its changes and can be accepted again once the cause is fixed.
+function acceptWriteError(workpiece: string, err: unknown): Error {
+  return new Error(`Cannot accept changes to ${workpiece}: ${stringifyError(err)}`, {cause: err});
+}
 
 // Safely convert an unknown thrown value to a human-readable string.
 // Plain objects would otherwise render as "[object Object]".
@@ -1017,6 +509,7 @@ function actionRecordToLog(record: ActionRecord): ActionLogEntry {
         description: record.description,
         resolvedBy: record.resolvedBy,
         autoApproved: record.autoApproved,
+        creation: record.action === "create" || undefined,
       };
     case "bindHook":
       return {
@@ -1049,410 +542,6 @@ function stampBindHookAction(storage: OverseerStorage, actionId: number, enabled
   actionRecord.appliedAt = new Date();
   storage.actions.put(actionRecord);
 }
-
-// Key of the actions `byLastChanged` index: last state-change time, id-disambiguated because the
-// frozen clock makes same-instant records routine. Every mutation path stamps appliedAt (apply,
-// reject, stampBindHookAction); one that doesn't would be missed by the resume replay.
-function actionLastChangedKey(record: ActionRecord): string {
-  return `${keyString(actionChangeTime(record).valueOf())}.${keyString(record.id)}`;
-}
-
-/**
- * One incremental update in the workspace-wide Yjs code log (the `code` and `snapshots`
- * collections). Formerly the public `CodeUpdate` wire type; the git-storage transition removed it
- * from the API along with `subscribeToCode()` (mainline code becomes commits; see git-store.ts),
- * leaving it as the internal record type of the retired log, whose one remaining reader is the
- * git-storage migration's replay (git-migration.ts).
- */
-type CodeUpdate = {
-  /** Version number of the code AFTER this update has been applied. */
-  version: number;
-
-  /** Original timestamp of this update. */
-  timestamp: Date;
-
-  /** Yjs-encoded (V2) update blob. */
-  update: Uint8Array;
-};
-
-/**
- * The Overseer's storage schema. Exported for the git-migration tests, which drive
- * migrateCodeLogToGit() over synthetic legacy workspaces built on mock storage with the real
- * schema.
- */
-export function makeOverseerStorage(storage: DurableObjectStorage) {
-  return createTypedStorage(storage, {
-    singletons: {
-      // Initialized on first startup.
-      ownerId: <string | undefined>undefined,
-
-      // Version of this DO's storage schema, gating lazy migrations. Used to trigger migrations
-      // at construction time.
-      //   0 = Workspace from before multi-gadget mode was introduced (unless `ownerId` is absent,
-      //       in which case this is a brand-new DO). The workspace contains at most one gadget,
-      //       which becomes `defaultGadgetId`. (If the workspace has no code or named bindings,
-      //       treat as having zero gadgets.)
-      //   1 = multi-gadget: the `gadgets` registry is the source of truth; binding names and
-      //       blueprint annotations live on binding edges; boundHooks/blueprints records carry a
-      //       gadgetId. Additionally (added before the 0 -> 1 migration was ever deployed, so no
-      //       new version was minted): gadget records carry a `bindingName` (from which chat
-      //       binding-map seeds are derived), and agent-spawner configs hold the new
-      //       `env: Record<name, WorkpieceId>` form (old `env?: string[]` allowlists rewritten,
-      //       in both the creationSpec and the class stub's baked-in props).
-      //   2 = git-backed code: mainline code lives in `gitObjects` as commits synthesized from
-      //       the legacy `code` log (see git-migration.ts); gadget records carry a `commitId`,
-      //       blueprint records reference commits, historical merge messages carry `commits`,
-      //       and every live chat was converted to the commit-pinned change stream (a
-      //       `conversionBoundary` changes message plus a `codeBase`). The `code`/`snapshots`
-      //       collections are dead stored data from this version on.
-      //   3 = the actions collection's indexes (pendingByGatekeeper, byHistoryFilter,
-      //       byLastChanged) exist and are backfilled.
-      //   4 = unified workpiece records: every row of the `gadgets` collection carries the
-      //       WorkpieceRecord `type` discriminant (pre-existing rows stamped "gadget"); worktree
-      //       rows may exist from here on.
-      version: 0,
-
-      // The workspace title. (Each chat, gatekeeper, and gadget has its own title, elsewhere.)
-      title: "Untitled Workspace",
-
-      // If present, this gadget was migrated from version zero, when a workspace had only one
-      // gadget. Many stored records that normally contain a `gadgetId` might be missing it; they
-      // should be treated as referring to this gadget ID.
-      //
-      // Additionally, the specified gadget ID is named specially in certain contexts:
-      // - In the Yjs doc, the root name is the empty string, rather than the decimal
-      //   stringification of the ID.
-      // - The facet name is just "gadget", rather than "gadget<N>".
-      //
-      // `defaultGadgetId` is not present for new gadgets created in multi-gadget mode. It is also
-      // not present for upgraded workspaces that did not have any relevant gadget content at the
-      // time of upgrade.
-      //
-      // Aside from when it is set while auto-creating a workspace's first (only) gadget -- during
-      // migration from version 0, or when instantiating a blueprint into a fresh workspace (see
-      // ensureDefaultGadget) -- `defaultGadgetId` must NEVER be changed. Even if the gadget is
-      // deleted, `defaultGadgetId` remains so that old records can be correctly interpreted (as
-      // referring to a deleted gadget). Since it can't change after workspace initialization,
-      // `defaultGadgetId` can be cached in memory after it is first read.
-      defaultGadgetId: <WorkpieceId | undefined>undefined,
-
-      // External-message Gadgets claim ownership before registering in the owner's UserDO. If that
-      // registration fails, this keeps the owner-table write retryable.
-      ownerRegistrationPending: false,
-
-      codeVersion: 0,
-      totalCost: 0,
-
-      // Next workpiece ID. This is called `nextGatekeeperId` for historical reasons (it predates
-      // the ability to have multiple gadgets per workspace), but it is actually used to allocate
-      // workpiece IDs of any type.
-      nextGatekeeperId: 0,
-
-      nextActionId: 0,
-      nextChatId: 0,
-      nextHookId: 0,
-      nextAgentCallId: 0,
-
-      // OBSOLETE: deadWorktreeIds existed to facilitate hiding worktrees from clients, but we
-      // no longer do that. Noted here since old workspaces may still have a singleton by this
-      // name in storage.
-      // deadWorktreeIds: <WorkpieceId[]>[],
-
-      // True if any past observation was authorized that had the `containsRestrictedData` flag
-      // set in its `ObservationDescription`. While set, public-web fetches are refused and every
-      // action pends for manual approval (autoApprovalRule never fires); the approver checks the
-      // action text for restricted data. The key on disk predates the flag's rename.
-      containsRestrictedData: singleton(false, {storageKey: "prohibitAllSharing"}),
-
-      // True if any past observation was authorized that had the `ownerInvitesOnly` flag set in
-      // its `ObservationDescription`. Share links stop working and only the owner can add
-      // collaborators (enforced by SharingManager).
-      ownerInvitesOnly: singleton(false),
-    },
-
-    collections: {
-      // READ-ONLY LEGACY: the pre-git-storage incremental code log, tightly-packed from version 1
-      // (there's no entry for version 0, the starting empty state). Nothing writes it anymore --
-      // mainline code lives in `gitObjects` as commits -- and it is read only by the git-storage
-      // migration (git-migration.ts), which collapses each pre-git chat's uncommitted state into
-      // a conversion change; deletion is a later cleanup change. Workspaces initialized after git
-      // storage never write it at all.
-      code: collection<CodeUpdate>()({
-        primaryKey: "version"
-      }),
-
-      // READ-ONLY LEGACY: "snapshots" of the code log, each an encoded update "from zero",
-      // formerly a replay optimization. Nothing reads or writes them anymore (the migration's
-      // single replay scans `code` itself); retained as dead stored data alongside `code` for
-      // one release as rollback insurance, then deleted together.
-      snapshots: collection<CodeUpdate>()({
-        primaryKey: "version"
-      }),
-
-      // The workspace's git object store: real git loose objects (blobs, trees, commits) keyed
-      // by 40-hex SHA-1 oid. Mainline gadget code lives here as commits, with each
-      // GadgetRecord.commitId pointing at its head (superseding the `code`/`snapshots` Yjs log).
-      // There is deliberately no ref layer: gadget/blueprint records and chats' pinned commits
-      // are the refs, and all gadgets' histories share this one content-addressed store. See
-      // git-store.ts.
-      gitObjects: gitObjectsCollection(),
-
-      // Per-oid provenance and push-authorization metadata over `gitObjects`: which gatekeepers'
-      // remotes provably hold each object, which claim to (pull routing), and which queued
-      // actions plan to push it (indexed by action id, so apply/reject can convert or clean an
-      // action's marks without re-walking the object graph). Kept separate from `gitObjects`
-      // because reading an object row means reading its whole content, and because metadata
-      // routinely exists for objects the store does not hold. See git-cache.ts.
-      gitObjectMetadata: gitObjectMetadataCollection(),
-
-      // Registry of gadget and worktree workpieces (named before worktrees existed; see
-      // WorkpieceRecord).
-      //
-      // Note that this collection -- not the set of Y.Doc roots -- is the enumeration source of
-      // truth for which gadgets exist: content can linger in (or even be resurrected into) the
-      // files root of a deleted gadget, since Yjs roots can't be deleted and whole-doc sync can't
-      // stop an old client or later-merged branch from writing there. Such content is inert --
-      // never listed, loaded, executed, or rendered -- because it has no registry entry.
-      gadgets: collection<WorkpieceRecord>()({
-        primaryKey: "id",
-
-        uniqueIndexes: {
-          // Enforces workspace-wide uniqueness of gadget binding names (see
-          // GadgetRecord.bindingName): a put() that would reuse another gadget's name throws.
-          // Because pending gadgets' records are real, this makes a provisional gadget reserve its
-          // name from the moment of creation, exactly like pending binding edges reserve theirs.
-          // Worktree rows opt out (null, the pattern the gatekeepers index uses): they carry no
-          // bindingName, so two chats can each have a worktree named REPO without conflict.
-          byBindingName(record: WorkpieceRecord) {
-            return record.bindingName ?? null;
-          }
-        }
-      }),
-
-      gatekeepers: collection<GatekeeperRecord>()({
-        primaryKey: "id",
-
-        // OBSOLETE: The `bindingName` property of `GatekeeperRecord` is now obsolete, but the
-        // index still exists for now. This may be cleaned up in a later migration (but doing so
-        // may require support from the typed-storage package).
-        uniqueIndexes: {
-          byBindingName(gatekeeper: GatekeeperRecord) {
-            return gatekeeper.bindingName ?? null;
-          }
-        }
-      }),
-
-      actions: collection<ActionRecord>()({
-        primaryKey: "id",
-
-        // All three indexes are backfilled by the version-3 migration.
-        uniqueIndexes: {
-          // Resume-replay index (see subscribeToActions): keyed by last state-change time so a
-          // reconnect replays only the records changed during the gap.
-          byLastChanged: actionLastChangedKey,
-        },
-
-        nonUniqueIndexes: {
-          // Sparse index over just the pending records, keyed by gatekeeper, so the auto-approval
-          // drain is O(pending on that gatekeeper) rather than a full-log scan.
-          pendingByGatekeeper(record: ActionRecord) {
-            return record.state === "pending" ? record.gatekeeperId : null;
-          },
-
-          // Keyed by the wire ActionHistoryFilter values, in lockstep with
-          // matchesActionHistoryFilter (api.ts), so every listActions() filter is one ranged
-          // read. The "all" filter has no key: it reads the collection itself.
-          byHistoryFilter(record: ActionRecord) {
-            return record.state === "pending" ? ["pending", record.type] : record.type;
-          },
-        }
-      }),
-
-      boundHooks: collection<BoundHookRecord>()({
-        primaryKey: "id",
-      }),
-
-      // User-enabled rules to auto-approve actions carrying a given action kind on a given
-      // gatekeeper. Presence of a record -> the rule is enabled. Keyed by
-      // `${gatekeeperId}:${actionKind.tag}`.
-      autoApproveTags: collection<AutoApproveTagRecord>()({
-        primaryKey: (r) => `${r.gatekeeperId}:${r.actionKind.tag}`,
-      }),
-
-      chatMeta: collection<StoredChatMetadata>()({
-        primaryKey: "id",
-
-        // Allow quick lookup of chats with active agents.
-        uniqueIndexes: {
-          byLastActive(meta: StoredChatMetadata) { return meta.lastActive.valueOf(); }
-        }
-      }),
-
-      chatContext: collection<AiChatAgentContext>()({
-        primaryKey: "chatId"
-      }),
-
-      // Compaction checkpoints, keyed by `chatId.compactedTo` so a chat's checkpoints sort by
-      // boundary. A chat keeps every checkpoint it has published, not just the newest: reverting
-      // across a boundary needs the one before it (see rollbackChatCompaction), and only that path
-      // and deleting the chat remove any.
-      chatCompactions: collection<CompactionCheckpoint>()({
-        primaryKey: (checkpoint) => compactionKey(checkpoint.chatId, checkpoint.compactedTo),
-      }),
-
-      // Tracks in-progress agent turns so they can be resumed after a server restart. See
-      // `ActiveAgentRecord`.
-      activeAgents: collection<ActiveAgentRecord>()({
-        primaryKey: "chatId"
-      }),
-
-      gadgetResponseDeliveries: collection<ExternalMessageRecord>()({
-        primaryKey: "idempotencyKey",
-        uniqueIndexes: {
-          undeliveredByChatId(record: ExternalMessageRecord) {
-            return record.status === "delivered" ? null : record.chatId;
-          },
-        },
-        nonUniqueIndexes: {
-          // Retry delivery by listing only ready records, not the whole idempotency history.
-          readyByIdempotencyKey(record: ExternalMessageRecord) {
-            return record.status === "ready" ? record.idempotencyKey : null;
-          },
-          // Sweep expired delivered records by age without scanning pending/ready records.
-          deliveredByDeliveredAt(record: ExternalMessageRecord) {
-            return record.status === "delivered" ? record.deliveredAt : null;
-          },
-        },
-      }),
-
-      externalChats: collection<ExternalChatRecord>()({
-        primaryKey: "externalChatKey",
-      }),
-
-      chats: collection<AiChatMessage>()({
-        primaryKey(msg: AiChatMessage) {
-          return `${keyString(msg.chatId)}.${keyString(msg.sequence)}`;
-        },
-        uniqueIndexes: {
-          byTimestamp(msg: AiChatMessage) { return msg.timestamp.valueOf(); }
-        }
-      }),
-
-      // READ-ONLY LEGACY: pre-git-storage live drafts. Retained only as migration input (the
-      // conversion change folds them in and deletes them); nothing else reads or writes it, apart
-      // from deleteChat's defensive sweep.
-      chatDraftUpdates: collection<ChatDraftUpdateRecord>()({
-        primaryKey(record: ChatDraftUpdateRecord) {
-          return `${keyString(record.chatId)}.${keyString(record.timestamp.valueOf())}`;
-        }
-      }),
-
-      // The chats' code-change streams (see ChatChangeRecord). Keyed so a generation's rows list in
-      // revision order under one prefix.
-      chatChanges: collection<ChatChangeRecord>()({
-        primaryKey(record: ChatChangeRecord) {
-          return `${keyString(record.chatId)}.${keyString(record.generation)}.` +
-              keyString(record.revision);
-        }
-      }),
-
-      // Per-(user, client session) submission dedupe records (see ChatChangeClientRecord). The
-      // clientId's validated charset keeps the composed key unambiguous.
-      chatChangeClients: collection<ChatChangeClientRecord>()({
-        primaryKey(record: ChatChangeClientRecord) {
-          return `${keyString(record.chatId)}.${record.userId}:${record.clientId}`;
-        }
-      }),
-
-      // Each chat's most recent content-preserving generation boundary, for the straggler
-      // bridge (see ChatChangeBoundaryRecord). At most one per chat.
-      chatChangeBoundaries: collection<ChatChangeBoundaryRecord>()({
-        primaryKey: "chatId"
-      }),
-
-      nextChatSequences: collection<{chatId: number, nextSequence: number}>()({
-        primaryKey: "chatId"
-      }),
-
-      // Storable version of agent callback arguments, stored separately from the chat
-      // messages to avoid sending potentially large data (including Fetchers) to clients.
-      // Keyed by chatId.sequence matching the agentCallback chat message.
-      agentCallbackArgs: collection<{chatId: number, sequence: number, args: unknown[]}>()({
-        primaryKey(entry) {
-          return `${keyString(entry.chatId)}.${keyString(entry.sequence)}`;
-        }
-      }),
-
-      // Calls delivered to a callable agent that have not yet been appended to its chat log.
-      // Written synchronously by deliverAgentCallback so a call is durable the moment the
-      // caller's RPC returns; drained into agentCallback messages (and agentCallbackArgs records)
-      // by drainPendingAgentCalls at turn boundaries. Keyed by chatId.callId so a chat's calls
-      // list in arrival order.
-      pendingAgentCalls: collection<PendingAgentCallRecord>()({
-        primaryKey(entry) {
-          return `${keyString(entry.chatId)}.${keyString(entry.callId)}`;
-        }
-      }),
-
-      // Model-facing snapshots of agent steps, replayed verbatim on later turns so reasoning
-      // (including provider-opaque signatures) and true model provenance survive turn boundaries
-      // and restarts. Stored separately from the chat messages so these payloads -- opaque and
-      // potentially several KB per step -- are never sent to clients. Keyed by chatId.sequence
-      // matching the step's "message" chat record.
-      chatModelData: collection<ChatModelDataRecord>()({
-        primaryKey(entry: ChatModelDataRecord) {
-          return `${keyString(entry.chatId)}.${keyString(entry.sequence)}`;
-        }
-      }),
-
-      collaborators: collection<CollaboratorRecord>()({
-        primaryKey: record => record.profile.id
-      }),
-
-      // Share links and their copies; see ShareKeyRecord. The index groups a link's copies under
-      // the link's id, so a GC can enumerate or drop them together (`byAlias.delete(linkId)`).
-      shareKeys: collection<ShareKeyRecord>()({
-        primaryKey: "id",
-        nonUniqueIndexes: {
-          byAlias(record: ShareKeyRecord) {
-            return record.alias ?? null;
-          }
-        }
-      }),
-
-      blueprints: collection<BlueprintGadgetRecord>()({
-        primaryKey: "id"
-      }),
-
-      // Attachment bytes. Before an attachment is committed to a chat message, this also carries
-      // the temporary metadata needed to construct its ChatAttachmentRef. Once committed, the
-      // message owns that metadata and this record retains only the bytes and owning chat ID.
-      chatAttachmentContent: collection<ChatAttachmentContentRecord>()({
-        primaryKey: "fileId",
-        nonUniqueIndexes: {
-          stagedByUploadedAt(record: ChatAttachmentContentRecord) {
-            return record.state.type === "staged" ? record.state.uploadedAt : null;
-          },
-        },
-      }),
-
-      // Non-owner collaborators who have configured their gatekeeper accounts and passed all
-      // `addObserver` checks. See `ObserverRecord`. The secondary index lets the forward-exclusion
-      // path (`authorizeObservation`) map an opaque observerId back to a profileId.
-      observers: collection<ObserverRecord>()({
-        primaryKey: "profileId",
-        uniqueIndexes: {
-          byObserverId(observer: ObserverRecord) {
-            return observer.observerId;
-          }
-        }
-      }),
-    }
-  });
-}
-
-/** The Overseer's typed storage. See makeOverseerStorage. */
-export type OverseerStorage = ReturnType<typeof makeOverseerStorage>;
 
 // Validates a client-supplied commit oid before it reaches the git store.
 function validateOid(oid: string): string {
@@ -1948,7 +1037,8 @@ class OverseerImpl implements AgentHooks {
     }
 
     await this.#runAgentTurn(
-        record.chatId, aiModel, record.initiator, record.callbackInitiated, liveChat);
+        record.chatId, aiModel, record.initiator, record.initiatorUserId, record.callbackInitiated,
+        liveChat);
   }
 
   // The hand-off once a chat's turn is over and its running-agent state has been torn down: drop
@@ -1978,12 +1068,13 @@ class OverseerImpl implements AgentHooks {
     this.users = this.ctx.exports.UserDurableObject;
     this.ownerId = this.storage.ownerId.get();
 
-    // Run any pending storage migration before anything else can touch storage. This must happen
-    // in the constructor (not just open()) because the DO also wakes via constructor-driven
-    // agent-turn restoration below, hook deliveries, and [restore]()-based persistent callbacks.
-    // This migration is fully synchronous, so nothing can observe pre-migration state; the
-    // git-storage migration below is the asynchronous one, shielded by blockConcurrencyWhile.
-    this.#migrateStorage();
+    // Run any pending storage migration (see storage-schema/overseer-migrations.ts) before
+    // anything else can touch storage. This must happen in the constructor (not just open())
+    // because the DO also wakes via constructor-driven agent-turn restoration below, hook
+    // deliveries, and [restore]()-based persistent callbacks. This migration is fully
+    // synchronous, so nothing can observe pre-migration state; the git-storage migration below
+    // is the asynchronous one, shielded by blockConcurrencyWhile.
+    migrateToMultiGadget(this);
     this.defaultGadgetId = this.storage.defaultGadgetId.get();
 
     this.#autoApprovalDrainer = new AutoApprovalDrainer(
@@ -2015,13 +1106,15 @@ class OverseerImpl implements AgentHooks {
       // to do -- blockConcurrencyWhile has already aborted the DO -- but the rejection must be
       // consumed so it doesn't also surface as an unhandled rejection.
       this.ctx.blockConcurrencyWhile(async () => {
-        await this.#migrateToGitStorage();
-        this.#migrateToActionIndexes();
-        this.#migrateToWorkpieceTypes();
+        await migrateToGitStorage(this);
+        migrateToActionIndexes(this);
+        migrateToWorkpieceTypes(this);
+        migrateToBlueprintUpstreams(this);
       }).then(() => this.#resumeInterruptedAgents(), () => {});
     } else {
-      this.#migrateToActionIndexes();
-      this.#migrateToWorkpieceTypes();
+      migrateToActionIndexes(this);
+      migrateToWorkpieceTypes(this);
+      migrateToBlueprintUpstreams(this);
       this.#resumeInterruptedAgents();
     }
   }
@@ -2065,195 +1158,8 @@ class OverseerImpl implements AgentHooks {
     this.drainAllPendingAgentCalls();
   }
 
-  // Runs the git-storage migration (see git-migration.ts) and stamps schema version 2. The
-  // version stamp is written last: storage writes persist in order, so a crash mid-migration
-  // leaves the version at 1 and the next construction redoes the whole (re-runnable) migration.
-  async #migrateToGitStorage(): Promise<void> {
-    let startedAt = Date.now();
-    let { commits } = await migrateCodeLogToGit({
-      storage: this.storage,
-      gitStore: this.gitStore,
-      ownerIdentity: await this.#ownerCommitIdentity(),
-      defaultGadgetId: this.defaultGadgetId,
-      createDefaultGadget: () => this.ensureDefaultGadget(undefined),
-      gadgetRootName: (id) => this.gadgetRootName(id),
-      getActiveChatCompaction: (chatId) => this.getActiveChatCompaction(chatId),
-      getChatTimestamp: () => this.getChatTimestamp(),
-    });
-    this.storage.version.put(2);
-    this.logger.info("migrated workspace code to git storage", {
-      event: "storage.migration.git.completed",
-      durationMs: Date.now() - startedAt, commitCount: commits,
-    });
-  }
-
-  // Version 2 -> 3: backfill the actions indexes. Indexes are only maintained at write time, so
-  // over records that predate their declaration they start empty -- and updating a pre-existing
-  // action would then throw on the index update. Runs synchronously in the constructor (chained
-  // after the git-storage migration when that one is still pending), so nothing can observe
-  // pre-migration state; transactionSync makes rebuilds-plus-stamp atomic, so a crash
-  // mid-rebuild retries whole. The `!== 2` guard keeps never-initialized DOs write-free (they
-  // stamp the current version at first initialization).
-  #migrateToActionIndexes(): void {
-    if (this.storage.version.get() !== 2) return;
-    this.ctx.storage.transactionSync(() => {
-      this.storage.actions.pendingByGatekeeper.rebuild();
-      this.storage.actions.byHistoryFilter.rebuild();
-      this.storage.actions.byLastChanged.rebuild();
-      this.storage.version.put(3);
-    });
-    this.logger.info("backfilled the action-log indexes", {
-      event: "storage.migration.action-indexes.completed",
-    });
-  }
-
-  // Version 3 -> 4: stamp every pre-existing `gadgets` row with the WorkpieceRecord `type`
-  // discriminant (all such rows are gadgets; worktrees postdate this version). Required rather
-  // than an absent-means-gadget default, so consumers dispatch on `type` without carrying
-  // undefined-handling forever. Runs synchronously in the constructor, chained after
-  // #migrateToActionIndexes in both branches so a v1 workspace runs 1→2, 2→3, 3→4 in one wake;
-  // transactionSync makes rewrite-plus-stamp atomic, so a crash mid-rewrite retries whole; and
-  // the `!== 3` guard keeps never-initialized DOs write-free. No byBindingName rebuild is
-  // needed: every pre-existing row carries a bindingName, so the keys the index already holds
-  // are exactly what its `?? null` function computes for them.
-  #migrateToWorkpieceTypes(): void {
-    if (this.storage.version.get() !== 3) return;
-    this.ctx.storage.transactionSync(() => {
-      for (let record of Array.from(this.storage.gadgets.list())) {
-        // Pre-v4 rows lack the discriminant at runtime (whatever the type says), and all of
-        // them are gadgets.
-        this.storage.gadgets.put({...(record as GadgetRecord), type: "gadget"});
-      }
-      this.storage.version.put(4);
-    });
-    this.logger.info("stamped workpiece record types", {
-      event: "storage.migration.workpiece-types.completed",
-    });
-  }
-
-  // The workspace owner's commit identity, for commits synthesized by the git-storage migration.
-  // A transient user-DO reset is retried once (pure read on a fresh-stub helper); anything past
-  // that degrades to a placeholder rather than failing: identity on synthesized history is
-  // cosmetic, and blocking the migration on the owner's User DO would leave the workspace
-  // unusable for as long as that DO is unreachable (or its account gone).
-  async #ownerCommitIdentity(): Promise<CommitIdentity> {
-    try {
-      if (this.ownerId !== undefined) {
-        let profile = await retryOnDoReset(
-            () => this.#ownerUserDo().whoamiIfExists(), this.logger);
-        if (profile) return commitIdentityForAuthor(profile);
-      }
-    } catch (err) {
-      this.logger.warn("failed to resolve owner identity for history import", {
-        event: "storage.migration.git.owner-identity.failed", error: err,
-      });
-    }
-    return { name: "Workspace owner", email: "owner@localhost" };
-  }
-
   // =======================================================================================
-  // Multi-gadget workspace helpers: storage migration, the gadget registry, and
-  // defaultGadgetId resolution.
-
-  // Migrate storage to the current schema version. Runs synchronously in the constructor.
-  #migrateStorage(): void {
-    if (this.storage.version.get() !== 0) return;
-    if (this.ownerId === undefined) {
-      // Brand-new (or never-initialized) DO: there is nothing to migrate. We deliberately avoid
-      // writing anything here, so that probing a nonexistent DO leaves no storage behind; the
-      // version singleton is set when the workspace is first initialized (see
-      // OverseerDurableObject.open() / receiveExternalMessage()).
-      return;
-    }
-
-    // Run the whole migration in one transaction so that a mid-migration error can't leave the
-    // workspace half-migrated.
-    let startedAt = Date.now();
-    this.ctx.storage.transactionSync(() => {
-      // Version 0 -> 1: the workspace predates multi-gadget support. If it has any gadget content
-      // (code beyond the initial empty snapshot, or named bindings), register that content as the
-      // workspace's single gadget and record it as the default gadget; binding names and blueprint
-      // annotations move from the gatekeeper records onto the gadget's binding edges. (The stale
-      // originals are left on the gatekeeper records; see GatekeeperRecord.) A workspace with no
-      // gadget content migrates to zero gadgets.
-      let hasCode = [...this.storage.code.list({limit: 1, start: 2})].length > 0;
-      let allGatekeepers = [...this.storage.gatekeepers.list()];
-      let namedGatekeepers = allGatekeepers.filter(gk => gk.bindingName !== undefined);
-
-      // The legacy flat env's named entries: each named gatekeeper, plus `GADGET -> the legacy
-      // gadget` when one is created below. Used to resolve spawner allowlists further down.
-      // (The workspace default binding list itself needs no migration step: it is derived on
-      // demand from the gadget record created below, whose bindingName and binding edges yield
-      // exactly this map -- so chats in old workspaces keep seeing `env.GADGET` and the same
-      // named bindings they always did.)
-      let legacyEnv: Record<string, WorkpieceId> = {};
-      for (let gk of namedGatekeepers) {
-        legacyEnv[gk.bindingName!] = gk.id;
-      }
-
-      if (hasCode || namedGatekeepers.length > 0) {
-        let id = this.allocateWorkpieceId();
-        // Set defaultGadgetId before putting the record so that gadgetRootName() (used by
-        // workpiece subscribers) resolves the legacy names.
-        this.storage.defaultGadgetId.put(id);
-        let bindings: Record<string, BindingRecord> = {};
-        for (let gk of namedGatekeepers) {
-          bindings[gk.bindingName!] = {
-            target: gk.id,
-            ...(gk.blueprintAnnotation ? {blueprintAnnotation: gk.blueprintAnnotation} : {}),
-          };
-        }
-        this.storage.gadgets.put({
-          type: "gadget",
-          id,
-          title: this.storage.title.get(),
-          created: new Date(),
-          bindingName: "GADGET",
-          bindings,
-        });
-        legacyEnv["GADGET"] = id;
-      }
-
-      // Rewrite each agent-spawner gatekeeper's config from the old `env?: string[]` binding-name
-      // allowlist to the new `env: Record<name, WorkpieceId>` form (see AgentSpawnerConfig). The
-      // config lives in two places and both must be updated: the record's `creationSpec`, and the
-      // props baked into the record's `class` stub. Props can't be edited in place, so the stub
-      // is recreated the same way newAgentSpawnerGatekeeper() creates it -- except that
-      // `creatorUserId` isn't recoverable from the record, so it is omitted, relying on the
-      // documented legacy fallback to the workspace owner.
-      for (let gk of allGatekeepers) {
-        if (gk.creationSpec?.type !== "agentSpawner") continue;
-        // The stored (pre-migration) shape is derived from the real type, differing only in
-        // `env`; the conflicting `env` types force the cast through `unknown`.
-        let {env: legacyAllowlist, ...restConfig} = gk.creationSpec.config as
-            unknown as Omit<AgentSpawnerConfig, "env"> & {env?: string[]};
-        let env: Record<string, WorkpieceId>;
-        if (legacyAllowlist !== undefined) {
-          // Resolve each allowlisted name against the gatekeepers' binding names, dropping any
-          // that no longer resolve.
-          env = {};
-          for (let name of legacyAllowlist) {
-            if (Object.hasOwn(legacyEnv, name)) env[name] = legacyEnv[name];
-          }
-        } else {
-          // An absent allowlist historically meant "unrestricted": the spawned agent saw every
-          // named binding plus GADGET -- exactly the legacy env map built above.
-          env = {...legacyEnv};
-        }
-        let config: AgentSpawnerConfig = {...restConfig, env};
-        gk.creationSpec = {...gk.creationSpec, config};
-        let props: AgentSpawnerBindingProps = {overseerId: this.ctx.id.toString(), config};
-        gk.class = this.ctx.exports.AgentSpawnerGatekeeper({props});
-        this.storage.gatekeepers.put(gk);
-      }
-
-      this.storage.version.put(1);
-    });
-
-    this.logger.info("migrated workspace storage", {
-      event: "storage.migration.completed", durationMs: Date.now() - startedAt,
-    });
-  }
+  // Multi-gadget workspace helpers: the gadget registry and defaultGadgetId resolution.
 
   // Allocate a workpiece ID from the shared counter. (The counter is named `nextGatekeeperId`
   // for historical reasons; see makeOverseerStorage.)
@@ -2305,13 +1211,6 @@ class OverseerImpl implements AgentHooks {
   // Whether the id names a live worktree record (a deleted workpiece is not a worktree here).
   isWorktree(id: WorkpieceId): boolean {
     return this.storage.gadgets.get(id)?.type === "worktree";
-  }
-
-  // Name of the legacy Y.Doc root map that held the given gadget's files in the retired
-  // pre-git code log. The default gadget used the unnamed root ""; all others the decimal
-  // workpiece ID. Only the git-storage migration still resolves roots (git-migration.ts).
-  gadgetRootName(id: WorkpieceId): string {
-    return this.defaultGadgetId === id ? "" : `${id}`;
   }
 
   // Facet name for the given gadget. The facet name is a storage key, so the default gadget
@@ -2366,11 +1265,14 @@ class OverseerImpl implements AgentHooks {
   // getting its creation recorded in the chat log so the pending record gets sequence-stamped
   // (see addChatMessages()). Otherwise the gadget is permanent and `initialCommitId` -- its
   // empty-tree initial commit, written by the caller beforehand -- is required: every permanent
-  // gadget is born with a head (see GadgetRecord.commitId). `output` is the format declared by
-  // the blueprint being instantiated, if any. `actorUserId` (hex user DO ID) feeds analytics only;
-  // a permanent creation's caller records its own workpiece_created, naming its source.
+  // gadget is born with a head (see GadgetRecord.commitId). `blueprint` is the blueprint being
+  // instantiated, if any, and `output` the format it declares. A gadget created from none is
+  // recorded as made from scratch (see GadgetRecord.upstream); one created from a blueprint
+  // comes to follow it when its creation is accepted. `actorUserId` (hex user DO ID) feeds
+  // analytics only; a permanent creation's caller records its own workpiece_created, naming its
+  // source.
   createGadget(title: string, bindingName: string, chatId?: number,
-               output?: BlueprintOutput, initialCommitId?: string,
+               blueprint?: {output?: BlueprintOutput}, initialCommitId?: string,
                actorUserId?: string): GadgetRecord {
     title = title.trim();
     if (!title) {
@@ -2396,8 +1298,11 @@ class OverseerImpl implements AgentHooks {
       bindingName,
       bindings: {},
     };
-    if (output) {
-      record.output = output;
+    if (blueprint?.output) {
+      record.output = blueprint.output;
+    }
+    if (!blueprint) {
+      record.upstream = {};
     }
     if (chatId !== undefined) {
       record.pending = {chatId};
@@ -2502,8 +1407,8 @@ class OverseerImpl implements AgentHooks {
     let reverted: WorkpieceRecord[] = [];
     if (stamped.length > 0) {
       let statuses = chatChangeStatuses(this.storage.chats.list({
-        prefix: `${keyString(chatId)}.`,
-        start: compactionKey(chatId, Math.min(...stamped.map(g => g.pending!.sequence!))),
+        prefix: chatKeyPrefix(chatId),
+        start: chatKey(chatId, Math.min(...stamped.map(g => g.pending!.sequence!))),
       }));
       reverted = stamped.filter(g => statuses.get(g.pending!.sequence!) === "reverted");
     }
@@ -2559,7 +1464,8 @@ class OverseerImpl implements AgentHooks {
   ensureDefaultGadget(commitId: string | undefined): WorkpieceId {
     if (this.defaultGadgetId !== undefined) return this.defaultGadgetId;
     let id = this.allocateWorkpieceId();
-    // Set defaultGadgetId first so subscribers computing gadgetRootName() see the legacy names.
+    // Set defaultGadgetId first, so that workpiece subscribers never see the gadget without its
+    // legacy names (see the `defaultGadgetId` singleton).
     this.storage.defaultGadgetId.put(id);
     this.defaultGadgetId = id;
     this.storage.gadgets.put({
@@ -2804,9 +1710,10 @@ class OverseerImpl implements AgentHooks {
   // subscribers), gadgets still provisional to some chat are withheld entirely, and so is every
   // worktree, accepted or not: both are proposals within the owner's chats, not part of the
   // shared workspace (a worktree is its chat's for life). (A gadget's promotion then surfaces it
-  // via the collection's update notification.) Every record write re-delivers the summary, which
-  // is how a worktree's `pinBase` (advanced by an accept) and `headCommit` (an explicit commit,
-  // or its rollback) reach clients.
+  // via the collection's update notification.) Those subscribers are not told which blueprint a
+  // gadget follows either: its id is a share link to code they have no other way to read. Every
+  // record write re-delivers the summary, which is how a worktree's `pinBase` (advanced by an
+  // accept) and `headCommit` (an explicit commit, or its rollback) reach clients.
   subscribeToWorkpieces(subscriber: RpcStub<WorkpiecesSubscriber>,
                         includePending: boolean): RpcStub<{}> {
     let gadgets = this.storage.gadgets;
@@ -2834,6 +1741,9 @@ class OverseerImpl implements AgentHooks {
       }
       if (record.output) {
         summary.output = record.output;
+      }
+      if (record.upstream && includePending) {
+        summary.upstream = record.upstream;
       }
       if (record.pending) {
         summary.chatId = record.pending.chatId;
@@ -2932,6 +1842,13 @@ class OverseerImpl implements AgentHooks {
     return this.gitStore.readCommitFiles(oid);
   }
 
+  // AgentHooks implementation, and the read behind Overseer.listChangedPaths: the paths whose
+  // entry differs between two commits' trees (see WorkspaceGitCache.changedFilePathsBetween),
+  // sorted.
+  async listChangedPaths(fromCommit: string, toCommit: string): Promise<string[]> {
+    return [...await this.gitCache.changedFilePathsBetween(fromCommit, toCommit)].toSorted();
+  }
+
   // AgentHooks implementation: lazily read one file of a commit's tree (see
   // WorkspaceGitCache.readFileAtCommitIfExists) -- the base resolver behind worktree reads and
   // the way unpinned gadget reads are served too.
@@ -2986,7 +1903,7 @@ class OverseerImpl implements AgentHooks {
   // materialize first (accept, update-from-mainline, UI bundle loads) or apply them on top
   // themselves (getCurrentChatContent).
   async buildChatContent(chatId: number, through?: number): Promise<CodeContent> {
-    let messages = [...this.storage.chats.list({prefix: `${keyString(chatId)}.`})];
+    let messages = [...this.storage.chats.list({prefix: chatKeyPrefix(chatId)})];
     if (through !== undefined) {
       messages = messages.filter(msg => msg.sequence <= through);
     }
@@ -3087,6 +2004,10 @@ class OverseerImpl implements AgentHooks {
     this.#chatContentCache.delete(chatId);
   }
 
+  // Live row count that triggers materialization (see submitCodeChange). A field so tests can
+  // reach the trigger without a thousand submissions.
+  chatChangeMaterializeThreshold = CHAT_CHANGE_MATERIALIZE_THRESHOLD;
+
   // Cache summarizing the live (unretired) window -- its summed serialized-size estimate and its
   // row count -- keyed by the (generation, revision) it reflects. submitCodeChange consults both
   // per keystroke (the byte trigger before appending, the row-count trigger after), and
@@ -3126,7 +2047,7 @@ class OverseerImpl implements AgentHooks {
   // cached so out-of-band row updates can't serve stale attribution data.
   #newestLiveChatChange(chatId: number, generation: number): ChatChangeRecord | undefined {
     for (let row of this.storage.chatChanges.list({
-      prefix: `${keyString(chatId)}.${keyString(generation)}.`, reverse: true, limit: 1,
+      prefix: chatKeyPrefix(chatId, generation), reverse: true, limit: 1,
     })) {
       return row.retired ? undefined : row;
     }
@@ -3270,9 +2191,9 @@ class OverseerImpl implements AgentHooks {
                        throughRevision: number): ChatChangeRecord[] | undefined {
     if (afterRevision >= throughRevision) return [];
     let rows = [...this.storage.chatChanges.list({
-      prefix: `${keyString(chatId)}.${keyString(generation)}.`,
-      startAfter: `${keyString(chatId)}.${keyString(generation)}.${keyString(afterRevision)}`,
-      end: `${keyString(chatId)}.${keyString(generation)}.${keyString(throughRevision + 1)}`,
+      prefix: chatKeyPrefix(chatId, generation),
+      startAfter: chatKey(chatId, generation, afterRevision),
+      end: chatKey(chatId, generation, throughRevision + 1),
     })];
     if (rows.length !== throughRevision - afterRevision ||
         rows[0].revision !== afterRevision + 1) {
@@ -3285,7 +2206,7 @@ class OverseerImpl implements AgentHooks {
   // into a "changes" message.
   listLiveChatChanges(chatId: number, generation: number): ChatChangeRecord[] {
     return [...this.storage.chatChanges.list({
-      prefix: `${keyString(chatId)}.${keyString(generation)}.`,
+      prefix: chatKeyPrefix(chatId, generation),
     })].filter(row => !row.retired);
   }
 
@@ -3419,10 +2340,9 @@ class OverseerImpl implements AgentHooks {
   // are no longer bridgeable at all.
   #pruneRetiredChatChanges(chatId: number): void {
     let cutoff = Date.now() - CHAT_CHANGE_RETIRED_TTL_MS;
-    for (let row of Array.from(this.storage.chatChanges.list({prefix: `${keyString(chatId)}.`}))) {
+    for (let row of Array.from(this.storage.chatChanges.list({prefix: chatKeyPrefix(chatId)}))) {
       if (row.retired && row.timestamp.getTime() < cutoff) {
-        this.storage.chatChanges.delete(
-            `${keyString(chatId)}.${keyString(row.generation)}.${keyString(row.revision)}`);
+        this.storage.chatChanges.deleteRecord(row);
       }
     }
   }
@@ -3430,23 +2350,23 @@ class OverseerImpl implements AgentHooks {
   // Erase every change row of the chat (a destructive bump, or chat deletion): retired rows too,
   // since a destructively-closed stream is not bridgeable.
   deleteAllChatChanges(chatId: number): void {
-    for (let row of Array.from(this.storage.chatChanges.list({prefix: `${keyString(chatId)}.`}))) {
-      this.storage.chatChanges.delete(
-          `${keyString(chatId)}.${keyString(row.generation)}.${keyString(row.revision)}`);
+    for (let row of Array.from(this.storage.chatChanges.list({prefix: chatKeyPrefix(chatId)}))) {
+      this.storage.chatChanges.deleteRecord(row);
     }
     this.storage.chatChangeBoundaries.delete(chatId);
     this.#chatContentCache.delete(chatId);
     this.#liveWindowCache.delete(chatId);
   }
 
-  // Gadgets whose pin establishment is recorded by a surviving (non-reverted) "changes" message
-  // in the chat's current epoch. The complement -- meta pins missing from this set -- is what
-  // materialization must stamp onto its message (see materializeChatChanges), and what pin rollback
-  // removes when the rows that established them are discarded.
-  declaredPinGadgets(chatId: number): Set<WorkpieceId> {
-    let messages = [...this.storage.chats.list({prefix: `${keyString(chatId)}.`})];
+  // Each gadget's last pin declaration on a surviving (non-reverted) "changes" message in the
+  // chat's current epoch: the one its content is rooted at (see ChatGadgetPinRecord). Meta pins
+  // missing from the map are what materialization must stamp onto its message (see
+  // materializeChatChanges), and what pin rollback removes when the rows that established them
+  // are discarded; a revert also takes each surviving pin's base from here.
+  declaredPins(chatId: number): Map<WorkpieceId, ChatGadgetPinRecord> {
+    let messages = [...this.storage.chats.list({prefix: chatKeyPrefix(chatId)})];
     let statuses = chatChangeStatuses(messages);
-    let declared = new Set<WorkpieceId>();
+    let declared = new Map<WorkpieceId, ChatGadgetPinRecord>();
     for (let msg of messages) {
       if (msg.type === "merge" && msg.epochBoundary) {
         declared.clear();
@@ -3455,25 +2375,29 @@ class OverseerImpl implements AgentHooks {
         // would reset the worktree's content mid-fold), and a revert must not drop them (they
         // root content that survived the accept; merges themselves are never reverted) -- the
         // next accept's epoch reset is what retires such a pin.
-        for (let pin of msg.worktreePins ?? []) declared.add(pin.worktreeId);
+        for (let pin of msg.worktreePins ?? []) {
+          declared.set(pin.worktreeId, {gadgetId: pin.worktreeId, baseCommit: pin.baseCommit});
+        }
       } else if (msg.type === "changes" && statuses.get(msg.sequence) !== "reverted") {
         if (msg.conversionBoundary) declared.clear();
-        for (let pin of msg.pins ?? []) declared.add(pin.gadgetId);
+        for (let pin of msg.pins ?? []) declared.set(pin.gadgetId, pin);
       }
     }
     return declared;
   }
 
   // Pins in the chat's live state (see ChatGadgetPinState) whose establishment no surviving
-  // current-epoch "changes" message records yet, stripped back to what the log stores. A pin
-  // lands in `codeBase` atomically with the row that needed it; its durable log declaration
-  // lands when the rows materialize.
-  undeclaredMetaPins(chatId: number, meta: AiChatMetadata): ChatGadgetPin[] {
+  // current-epoch "changes" message records yet, as the log records them. A pin lands in
+  // `codeBase` atomically with the row that needed it; its durable log declaration lands when
+  // the rows materialize.
+  undeclaredMetaPins(chatId: number, meta: AiChatMetadata): ChatGadgetPinRecord[] {
     let pins = meta.codeBase?.pins ?? [];
     if (pins.length === 0) return [];
-    let declared = this.declaredPinGadgets(chatId);
+    let declared = this.declaredPins(chatId);
     return pins.filter(pin => !declared.has(pin.gadgetId))
-        .map(pin => ({gadgetId: pin.gadgetId, baseCommit: pin.baseCommit}));
+        .map(({gadgetId, baseCommit, mergedCommit}) => ({
+          gadgetId, baseCommit, ...(mergedCommit !== baseCommit ? {mergedCommit} : {}),
+        }));
   }
 
   makeBindingLoopback(target: BindingLoopbackTarget, caller: GatekeeperCaller) {
@@ -3555,7 +2479,7 @@ class OverseerImpl implements AgentHooks {
           // inside are persistent stubs (that is what made the record storable), so they work
           // directly in env.
           let stored = this.storage.agentCallbackArgs.get(
-              `${keyString(chatId)}.${keyString(entry.messageSequence)}`);
+              chatKey(chatId, entry.messageSequence));
           if (!stored) {
             throw new Error("missing agentCallbackArgs value");
           }
@@ -3612,14 +2536,18 @@ class OverseerImpl implements AgentHooks {
   //
   // One message, always: the composition is kept storable by bounding what accumulates
   // (submitCodeChange materializes the pending window before a row would push its summed size
-  // past CHAT_CHANGE_MESSAGE_BUDGET; the agent's step buffer is bounded by STEP_CHANGE_BUDGET
-  // at the write call -- both declared in agent.ts), never by splitting the output --
+  // past MAX_CODE_CHANGE_SIZE; the agent's step buffer is bounded by the same cap at the write
+  // call), never by splitting the output --
   // splitting would scatter one batch's extras and edits across messages a suffix revert could
   // divide, and would break the agent's message-counting change-ID numbering.
   //
-  // `options.extras` lets the agent's step barrier attach its creations/binding additions, and
-  // updateChatFromMainline attaches its `mainlineMerge` record; a message is written when
-  // there is anything at all to record (rows, undeclared pins, or extras). `options.author`
+  // `options.extras` lets the agent's step barrier attach its creations/binding additions,
+  // updateChatFromMainline its `mainlineMerge` record, and applyBlueprint (or the barrier, for
+  // a gadget created from a blueprint) its `blueprintMerges`; a message is written when
+  // there is anything at all to record (rows, undeclared pins, or extras). `options.pins` are
+  // declarations the caller is about to put into the code base, which re-root their gadgets
+  // (see ChatGadgetPinRecord): updateChatFromMainline writes the message that declares them
+  // ahead of the pins themselves, since clients rebuild from the log. `options.author`
   // overrides the row-derived author (required when there are no rows). The returned
   // `sequence` is the first written message's.
   materializeChatChanges(chatId: number, meta?: AiChatMetadata, options?: {
@@ -3629,7 +2557,9 @@ class OverseerImpl implements AgentHooks {
     createdWorktrees?: {worktreeId: WorkpieceId, title: string, bindingName: string}[],
     addedBindings?: {gadgetId: WorkpieceId, name: string, target: WorkpieceId}[],
     worktreeCommits?: {worktreeId: WorkpieceId, commit: string, previousHead: string}[],
-    mainlineMerge?: {conflictPaths: string[]},
+    pins?: ChatGadgetPinRecord[],
+    mainlineMerge?: {conflictPaths: string[], gadgets: MainlineMergeGadget[]},
+    blueprintMerges?: BlueprintMerge[],
   }): {sequence: number, meta: AiChatMetadata} | undefined {
     if (!meta) {
       meta = this.storage.chatMeta.get(chatId);
@@ -3646,11 +2576,17 @@ class OverseerImpl implements AgentHooks {
 
     let codeBase = this.chatCodeBase(meta);
     let rows = this.listLiveChatChanges(chatId, codeBase.generation);
-    let pins = this.undeclaredMetaPins(chatId, meta);
+    let declared = options?.pins ?? [];
+    let pins = [
+      ...this.undeclaredMetaPins(chatId, meta)
+          .filter(pin => !declared.some(decl => decl.gadgetId === pin.gadgetId)),
+      ...declared,
+    ];
     let hasExtras = (options?.createdGadgets?.length ?? 0) > 0 ||
         (options?.createdWorktrees?.length ?? 0) > 0 ||
         (options?.addedBindings?.length ?? 0) > 0 ||
-        (options?.worktreeCommits?.length ?? 0) > 0 || options?.mainlineMerge !== undefined;
+        (options?.worktreeCommits?.length ?? 0) > 0 || options?.mainlineMerge !== undefined ||
+        (options?.blueprintMerges?.length ?? 0) > 0;
     if (rows.length === 0 && pins.length === 0 && !hasExtras) {
       return;
     }
@@ -3689,6 +2625,8 @@ class OverseerImpl implements AgentHooks {
           ? {worktreeCommits: options.worktreeCommits} : {}),
       ...(options?.mainlineMerge !== undefined
           ? {mainlineMerge: options.mainlineMerge} : {}),
+      ...(options?.blueprintMerges?.length
+          ? {blueprintMerges: options.blueprintMerges} : {}),
     }]);
 
     this.#retireChatChanges(rows);
@@ -3720,14 +2658,21 @@ class OverseerImpl implements AgentHooks {
         createdWorktrees: {worktreeId: WorkpieceId, title: string, bindingName: string}[],
         addedBindings: {gadgetId: WorkpieceId, name: string, target: WorkpieceId}[],
         worktreeCommits: {worktreeId: WorkpieceId, commit: string, previousHead: string}[],
+        blueprintMerges: BlueprintMerge[],
       },
       usage?: Usage, aiGatewayLogId?: string,
       aiGatewayLogRoute?: AiGatewayLogRoute): Promise<boolean> {
     let meta = this.storage.chatMeta.get(chatId);
     if (!meta) return false;  // chat deleted mid-turn
 
-    for (let {change} of step.changes) {
-      validateCodeChangeSchema(change);
+    for (const [changeIndex, {change}] of step.changes.entries()) {
+      try { validateCodeChangeSchema(change); }
+      catch (error) {
+        this.logger.error("invalid agent transform rejected at persistence", {
+          event: "agent.step.change.invalid", chatId, changeStage: "persist", changeIndex, ...agentCodeChangeShape(change),
+        });
+        throw error;
+      }
     }
 
     // The worktrees this step pins: every worktree of this chat its rows or commits touch that
@@ -3856,6 +2801,7 @@ class OverseerImpl implements AgentHooks {
           createdWorktrees: step.createdWorktrees,
           addedBindings: step.addedBindings,
           worktreeCommits: step.worktreeCommits,
+          blueprintMerges: step.blueprintMerges,
         }) !== undefined;
       });
     } catch (err) {
@@ -3911,7 +2857,7 @@ class OverseerImpl implements AgentHooks {
     // Dedupe by (user, clientId, seq) before anything that can reject the base: a retry of an
     // already-accepted change must get its recorded landing spot back even when its base has since
     // been destructively bumped or an agent turn has started.
-    let clientKey = `${keyString(chatId)}.${userId}:${submission.clientId}`;
+    let clientKey = chatChangeClientKey(chatId, userId, submission.clientId);
     let acked = this.#dedupeSubmission(clientKey, submission, digest);
     if (acked !== undefined) {
       return acked;
@@ -3953,18 +2899,25 @@ class OverseerImpl implements AgentHooks {
       // depends on the transform below, but transforms only ever drop file changes, so prefetching
       // for every *declared* pin (plus every bridge boundary commit) covers all cases.
       let content = await this.getCurrentChatContent(chatId, meta);
-      let pinData = new Map<string, {head: string, headParents: string[],
+      let pinData = new Map<string, {head: string, recentHeads: string[],
                                      baseFiles: Map<string, string>}>();
       let prefetchPin = async (gadgetId: WorkpieceId, baseCommit: string) => {
         if (pinData.has(`${gadgetId}:${baseCommit}`)) return;
         let record = this.storage.gadgets.get(gadgetId);
         let head = record?.type === "gadget" ? record.commitId : undefined;
         if (head === undefined) return;  // validated (and rejected) in the sync tail
+        // The head and up to two first-parent steps back, stopping at the declared base. One
+        // accept that writes on a merge commit moves the head two steps (`C = [M]`, `M = [H,
+        // ...]`), so a client that raced it still declares `H`. First parents only: a head's
+        // other parents (a merged release, a chat's snapshot) were never this gadget's head.
+        let recentHeads = [head];
+        while (recentHeads.length < 3 && recentHeads.at(-1) !== baseCommit) {
+          let parent = (await this.gitStore.readCommitObject(recentHeads.at(-1)!)).parent[0];
+          if (parent === undefined) break;
+          recentHeads.push(parent);
+        }
         pinData.set(`${gadgetId}:${baseCommit}`, {
-          head,
-          headParents: head === baseCommit
-              ? [] : (await this.gitStore.readCommitLog(head, {depth: 1}))[0].parents,
-          baseFiles: await this.gitStore.readCommitFiles(baseCommit),
+          head, recentHeads, baseFiles: await this.gitStore.readCommitFiles(baseCommit),
         });
       };
       for (let decl of submission.pins ?? []) {
@@ -4060,7 +3013,7 @@ class OverseerImpl implements AgentHooks {
       // stales nobody. (The append just advanced the window summary to `result`, so this is an
       // O(1) cache read, not a window scan.)
       if (this.#liveWindowSummary(chatId, result).count >=
-          CHAT_CHANGE_MATERIALIZE_THRESHOLD) {
+          this.chatChangeMaterializeThreshold) {
         this.materializeChatChanges(chatId);
       }
 
@@ -4074,7 +3027,7 @@ class OverseerImpl implements AgentHooks {
   #applyValidatedSubmission(
       chatId: number, meta: AiChatMetadata, codeBase: ChatCodeBase,
       submission: CodeChangeSubmission, author: AiChatAuthorInfo, content: CodeContent,
-      pinData: Map<string, {head: string, headParents: string[],
+      pinData: Map<string, {head: string, recentHeads: string[],
                             baseFiles: Map<string, string>}>,
       bridge: ChatChangeBoundaryRecord | undefined,
       worktreeBases: Map<WorkpieceId, string>,
@@ -4136,9 +3089,11 @@ class OverseerImpl implements AgentHooks {
       }
     }
 
-    // Establish pins: validate each declaration against the gadget's current head (tolerating a
-    // parent-of-head base -- the client raced exactly one merge) or the worktree's accepted
+    // Establish pins: validate each declaration against the gadget's current head (tolerating
+    // the two heads before it along first parents -- the client raced exactly one accept, which
+    // moves the head two steps when it writes on a merge commit) or the worktree's accepted
     // commit, idempotent against an identical existing pin, conflicting against a different one.
+    // A pin behind the head is harmless: the accept's stale gate catches it.
     let newPins: ChatGadgetPinState[] = [];
     let validationContent = content;
     for (let [gadgetId, baseCommit] of declarations) {
@@ -4175,7 +3130,7 @@ class OverseerImpl implements AgentHooks {
       if (prefetched === undefined || prefetched.head !== record.commitId) {
         return "retry";  // the head moved during the prefetches; re-resolve
       }
-      if (baseCommit !== prefetched.head && !prefetched.headParents.includes(baseCommit)) {
+      if (!prefetched.recentHeads.includes(baseCommit)) {
         throw new Error("Pin declaration does not match the gadget's current head.");
       }
       newPins.push({gadgetId, baseCommit, mergedCommit: baseCommit});
@@ -4226,16 +3181,19 @@ class OverseerImpl implements AgentHooks {
     //  - Attribution: the newest live rows belong to a different author who has gone idle, and
     //    one message must never blend two authors' sessions. (Two authors typing *concurrently*
     //    still share a batch, attributed to "Multiple Authors".)
-    //  - Byte budget: this row would push the window's summed change size past what one
-    //    "changes" message may compose (materialization writes exactly one message, so the
-    //    bound is enforced here, where rows accumulate). A row bigger than the whole budget
-    //    thus always lands in an empty window and later travels alone in one oversized message.
+    //  - Size: this row would push the window's summed change size past what one "changes"
+    //    message may compose (materialization writes exactly one message, so the bound is
+    //    enforced here, where rows accumulate; an unstorable message would wedge
+    //    materialization, which retries the same compose until it succeeds). A row that alone
+    //    exceeds the cap -- transformation can grow a validated change slightly -- lands in an
+    //    empty window and travels alone, in a message storage proved it can hold when the row
+    //    itself was written.
     let latest = this.#newestLiveChatChange(chatId, codeBase.generation);
     let authorSplit = latest !== undefined && !this.sameChatAuthor(latest.author, author) &&
         Date.now() - latest.timestamp.getTime() > CHAT_CHANGE_AUTHOR_SPLIT_MS;
     let window = this.#liveWindowSummary(chatId, codeBase);
     let byteSplit = window.count > 0 &&
-        window.bytes + codeChangeSerializedSize(transformed) > CHAT_CHANGE_MESSAGE_BUDGET;
+        window.bytes + codeChangeSerializedSize(transformed) > MAX_CODE_CHANGE_SIZE;
     if (authorSplit || byteSplit) {
       this.materializeChatChanges(chatId, meta);
       meta = this.getChatMetaOrThrow(chatId);
@@ -4291,7 +3249,7 @@ class OverseerImpl implements AgentHooks {
     let meta = this.assertChatNotActive(chatId);
 
     // Live change rows are part of the chat's current content, so materialize them first: the merge
-    // must take them as input, and its own row must be recorded after them.
+    // must take them as input, and its own message must be recorded after them.
     let materialized = this.materializeChatChanges(chatId, meta);
     if (materialized) meta = materialized.meta;
 
@@ -4324,29 +3282,59 @@ class OverseerImpl implements AgentHooks {
       return {conflictPaths: []};
     }
 
+    // Merge each stale gadget: the mainline commit the chat last merged (the pin's
+    // `mergedCommit`) is the base -- explicitly known, so no merge-base discovery -- the head is
+    // one side and the chat's files the other. Conflicting hunks keep inline diff3 markers for
+    // the user (or their agent) to clean up. Every merge is computed before anything is written.
     let content = await this.getCurrentChatContent(chatId, meta);
-    let merged: CodeContent = new Map(content);
-    let conflictPaths: string[] = [];
+    let merges: {pin: ChatGadgetPinState, head: string, bindingName: string,
+                 chatFiles: Map<string, string>, mainlineFiles: Map<string, string>,
+                 result: MergeResult}[] = [];
     for (let {record, pin} of stale) {
-      // The chat's last merged commit is the 3-way common ancestor -- explicitly known, so no
-      // merge-base discovery. Conflicting hunks keep inline diff3 markers for the user (or
-      // their agent) to clean up.
       let base = await this.gitStore.readCommitFiles(pin.mergedCommit);
-      let head = await this.gitStore.readCommitFiles(record.commitId!);
-      let result = threeWayMerge(base, head, merged.get(pin.gadgetId) ?? new Map(),
+      let mainlineFiles = await this.gitStore.readCommitFiles(record.commitId!);
+      let chatFiles = content.get(pin.gadgetId) ?? new Map<string, string>();
+      let result = threeWayMerge(base, mainlineFiles, chatFiles,
           {base: "merged base", ours: "mainline", theirs: "this chat"});
-      merged.set(pin.gadgetId, result.files);
-      conflictPaths.push(...result.conflictPaths.map(path => `${record.bindingName}/${path}`));
+      merges.push({pin, head: record.commitId!, bindingName: record.bindingName, chatFiles,
+                   mainlineFiles, result});
+    }
 
-      pin.mergedCommit = record.commitId!;
+    // Commit each merge (see MainlineMergeGadget): `S`, the chat's files before the update, on
+    // the commit the chat's changes were made on (the pin's base), and `M = [H, S]`, the result,
+    // with mainline first since it is the gadget's own history. The pin re-roots at `M` and
+    // records `H` as merged. A chat whose files are already in mainline's history had nothing
+    // of its own to merge, so it re-roots at `H` itself. These are content-addressed object
+    // writes, harmless if the revalidation below refuses; a discarded chat leaves them dangling.
+    let identity = commitIdentityForAuthor(author);
+    let declarations: ChatGadgetPinRecord[] = [];
+    let gadgets: MainlineMergeGadget[] = [];
+    let conflictPaths: string[] = [];
+    for (let {pin, head, bindingName, chatFiles, mainlineFiles, result} of merges) {
+      let chatCommit = filesEqual(chatFiles, await this.gitStore.readCommitFiles(pin.baseCommit))
+          ? pin.baseCommit
+          : await this.gitStore.writeFilesAsCommit(chatFiles, {
+              parents: [pin.baseCommit],
+              author: identity,
+              message: `Chat before update: ${meta.title}`,
+              timestamp: new Date(),
+            });
+      let mergeCommit = this.gitCache.isAncestor(chatCommit, head) &&
+              filesEqual(result.files, mainlineFiles)
+          ? head
+          : await this.gitStore.writeFilesAsCommit(result.files, {
+              parents: [head, chatCommit],
+              author: identity,
+              message: `Merge latest changes into chat: ${meta.title}`,
+              timestamp: new Date(),
+            });
+      declarations.push({gadgetId: pin.gadgetId, baseCommit: mergeCommit,
+                         ...(mergeCommit !== head ? {mergedCommit: head} : {})});
+      gadgets.push({gadgetId: pin.gadgetId, baseCommit: pin.mergedCommit, chatCommit,
+                    conflictPaths: result.conflictPaths});
+      conflictPaths.push(...result.conflictPaths.map(path => `${bindingName}/${path}`));
     }
     conflictPaths.sort();
-
-    // The merge result is delivered as an ordinary change row -- concurrent editors transform
-    // against it like any other remote change -- so it is expressed as a diff of the chat's current
-    // content. fast-diff's character-level minimality is a quality bonus for those transforms,
-    // not a correctness requirement.
-    let change = diffFiles(content, merged);
 
     // The awaits above are interleaving points. The chat lock excludes sibling mutations, but
     // an agent turn could have started, and new messages or rows could have been recorded;
@@ -4360,30 +3348,244 @@ class OverseerImpl implements AgentHooks {
       throw new Error("The chat changed while merging from mainline; please retry.");
     }
 
-    // Persist the advanced pins before recording the row and message: addChatMessages re-reads
-    // and re-writes the chat meta, so it must see this state. The advancement is applied to the
-    // freshly-read meta's own code base (its pins array is authoritative); a pin we merged is
-    // always still present in the fresh read -- only the lock-holding operations remove pins,
-    // and the revision token above excludes new submissions.
-    for (let {pin} of stale) {
-      let freshPin = freshCodeBase.pins.find(p => p.gadgetId === pin.gadgetId);
-      if (freshPin !== undefined) freshPin.mergedCommit = pin.mergedCommit;
-    }
-    freshMeta.codeBase = freshCodeBase;
-    freshMeta.lastActive = this.getChatTimestamp();
-    this.storage.chatMeta.put(freshMeta);
-
-    // Record the merge as a row (broadcast via changeApplied), then materialize it into a "changes"
-    // message carrying `mainlineMerge` -- even when the chat's content already matched mainline
-    // (no change, no conflicts): the message is the durable record that the pins advanced, which
-    // the revert guard (revertChanges) depends on. Without it, reverting the chat's earlier
-    // proposals could silently regress content the advanced pins claim as merged.
-    if (changedGadgets(change).length > 0) {
-      this.#appendChatChangeRow(chatId, freshMeta, author, change, [], merged);
-    }
-    this.materializeChatChanges(chatId, undefined, {author, mainlineMerge: {conflictPaths}});
+    // One synchronous step, in this order: the message that declares the re-roots, then the
+    // pins it declares, the end of the change stream and a destructive generation bump, as a
+    // revert does. A client rebuilds from the log on seeing the new generation, so the message
+    // has to be in the log by then. Every live row was materialized above, and the revision
+    // token rules out any since, so deleting the rows loses nothing the server accepted; a
+    // collaborator's keystrokes not yet acknowledged are dropped, as a revert drops them.
+    this.materializeChatChanges(chatId, freshMeta, {
+      author, pins: declarations, mainlineMerge: {conflictPaths, gadgets},
+    });
+    let updatedMeta = this.getChatMetaOrThrow(chatId);
+    let updatedCodeBase = this.chatCodeBase(updatedMeta);
+    updatedCodeBase.pins = updatedCodeBase.pins.map(pin => {
+      let declaration = declarations.find(decl => decl.gadgetId === pin.gadgetId);
+      return declaration === undefined ? pin : {
+        gadgetId: pin.gadgetId,
+        baseCommit: declaration.baseCommit,
+        mergedCommit: declaration.mergedCommit ?? declaration.baseCommit,
+      };
+    });
+    this.deleteAllChatChanges(chatId);
+    updatedCodeBase.generation += 1;
+    updatedCodeBase.revision = 0;
+    delete updatedCodeBase.prior;
+    updatedMeta.codeBase = updatedCodeBase;
+    updatedMeta.lastActive = this.getChatTimestamp();
+    this.storage.chatMeta.put(updatedMeta);
+    this.proposedChangesChanged(chatId);
 
     return {conflictPaths};
+  }
+
+  // The body of GadgetClient.applyBlueprint(): proposes, in a new chat, merging the blueprint's
+  // current release into the gadget. `userMeta` is the chat context of the user applying it,
+  // resolved for the model they named, and `clientUserId` is that user's DO id.
+  //
+  // Modelled on updateChatFromMainline(): the merge is written as a commit, `M = [H, R]`, which
+  // marks the release it merged (see releasesMergedSince), and the new chat is pinned at it,
+  // with the gadget's head `H` as the pin's `mergedCommit`. One "changes" message declares the
+  // pin and records the proposal (see AiChatMessageBody.blueprintMerges); it carries no change.
+  // Nothing here touches the gadget. Accepting the chat is what does, fast-forwarding through
+  // `M` (see mergeChanges).
+  async applyBlueprint(gadgetId: WorkpieceId, blueprintId: string,
+                       options: {allowUnrelated?: boolean}, userMeta: UserChatContext,
+                       clientUserId: string)
+      : Promise<ApplyBlueprintResult> {
+    let author = userMeta.profile;
+    let kvRecord = await readBlueprintKvRecord(this.env, blueprintId);
+    if (!kvRecord) throw new Error("Blueprint not found.");
+    let {metadata} = kvRecord;
+    let release = await this.loadBlueprint(blueprintId, metadata);
+
+    let record = this.getGadgetRecord(gadgetId);
+    let head = record.commitId;
+    if (head === undefined) {
+      // Its files live only in its chat's proposed changes, so there is no head to merge into.
+      throw new Error("This gadget is a provisional creation in a chat. Accept the chat's " +
+          "changes before applying a blueprint to it.");
+    }
+
+    let merge: BlueprintMerge = {
+      gadgetId, blueprintId, title: metadata.title, version: metadata.version, commitId: release,
+      kind: "follow", conflictPaths: [],
+      ...this.#missingBlueprintBindings(metadata, record),
+    };
+    // The pin the chat is created with, if any: at the merge commit, with the head it merged.
+    let pin: ChatGadgetPinState | undefined;
+    if (this.gitCache.isAncestor(release, head)) {
+      // The gadget's history already holds the release, so there is nothing to merge. What is
+      // left to propose is following this blueprint, if the gadget follows another: it may
+      // have come by the release through a blueprint derived from this one, or from a copy of
+      // this one under another id. Nothing is written and nothing is pinned, so the proposal
+      // cannot go stale: the release stays in the history of the head wherever the head moves.
+      if (record.upstream?.blueprintId === blueprintId && record.upstream.commitId === release) {
+        return {outcome: "upToDate"};
+      }
+    } else {
+      let base = await this.#blueprintMergeBase(record.upstream, head, release, blueprintId);
+      if (base === undefined) return {outcome: "baseUnavailable"};
+      if (base.unverified && !options.allowUnrelated) return {outcome: "unrelated"};
+
+      let ours = await this.gitStore.readCommitFiles(head);
+      let theirs = await this.gitStore.readCommitFiles(release);
+      let result = threeWayMerge(base.files, ours, theirs,
+          {base: "base", ours: "this gadget", theirs: "blueprint"});
+
+      // The kind is the merge's result: a "follow" if the gadget already had every change the
+      // release made, and a "fastForward" if the gadget had none of its own to keep. A conflict
+      // makes a "merge" even where no file changes: a file the gadget changed and the release
+      // deleted is kept, but whether it should stay is still to be decided.
+      merge.kind = filesEqual(result.files, ours) && result.conflictPaths.length === 0
+          ? "follow" : filesEqual(ours, base.files) ? "fastForward" : "merge";
+      merge.baseCommit = base.commitId;
+      merge.conflictPaths = result.conflictPaths;
+      if (base.unverified) merge.unverifiedBase = true;
+
+      // Every kind is committed, since the commit is what records the release in the gadget's
+      // history; a "follow" as much as any. A content-addressed object write, which a refusal
+      // below, or a chat that is discarded, leaves dangling.
+      let mergeCommit = await this.gitStore.writeFilesAsCommit(result.files, {
+        parents: [head, release],
+        author: commitIdentityForAuthor(author),
+        message: `Merge blueprint: ${metadata.title} v${metadata.version}`,
+        timestamp: new Date(),
+        headers: [releaseMergeHeader(release)],
+      });
+      pin = {gadgetId, baseCommit: mergeCommit, mergedCommit: head};
+    }
+
+    // The agent reviews a merge, and nothing else. Lines that merge cleanly can still disagree,
+    // which only something that reads the result will catch, and a conflict always needs
+    // resolving. Every other proposal leaves the gadget with files that are one side's exactly,
+    // its own or the blueprint's.
+    let reviewer = merge.kind === "merge" ? userMeta.aiModel : undefined;
+
+    // The awaits above are interleaving points, and an accept in some chat may have moved the
+    // gadget's head since it was read. Refuse rather than record a merge into a head that the
+    // gadget no longer has.
+    let fresh = this.storage.gadgets.get(gadgetId);
+    if (fresh?.type !== "gadget" || fresh.commitId !== head) {
+      throw new Error("The gadget changed while the blueprint was being applied; please retry.");
+    }
+
+    // One transaction, so that the chat exists only with its proposal: one message, which
+    // declares the pin the chat is created with and records the proposal. No client holds
+    // state for a chat that did not exist, so starting it re-rooted needs no generation bump.
+    let chatId!: number;
+    this.storage.transaction(() => {
+      chatId = this.nextChatId();
+      let timestamp = this.getChatTimestamp();
+      this.storage.chatMeta.put({
+        id: chatId,
+        title: `Update from blueprint: ${metadata.title}`,
+        started: timestamp,
+        lastActive: timestamp,
+        ...(pin !== undefined ? {codeBase: {pins: [pin], generation: 0, revision: 0}} : {}),
+      });
+      this.materializeChatChanges(chatId, undefined, {author, blueprintMerges: [merge]});
+
+      // Set last, since only a turn's own machinery may materialize into a chat that has one
+      // running.
+      if (reviewer) {
+        this.storage.chatMeta.put(
+            {...this.getChatMetaOrThrow(chatId), activeAgent: reviewer.profile});
+      }
+    });
+
+    // The turn has no message to answer. What prompts it is the record of the proposal, which
+    // replay renders as the agent's task (see the "changes" case of runAgentPass in agent.ts).
+    // Starting it here, with the chat, is what makes it one turn per proposal however many
+    // clients are watching.
+    if (reviewer) this.startAgent(chatId, reviewer, author, clientUserId);
+    return {outcome: "proposed", chatId};
+  }
+
+  // Chooses the commit to merge the release `release` into a gadget against, where the history
+  // of the gadget's head `head` does not hold that release, and reads its files. `upstream` is
+  // what the gadget follows. Returns undefined if the two histories have commits in common but
+  // the store holds the files of none: a release's ancestors mostly arrive without theirs.
+  //
+  // The base is the newest commit that both histories hold. Usually that is the release the
+  // gadget last took from this blueprint, or the one that a blueprint derived from another was
+  // built on. Histories that have merged each other can have several such commits, of which
+  // the one in the blueprint's own lineage is preferred, and then the latest.
+  //
+  // Histories with nothing in common leave the base to be assumed: the release the gadget last
+  // took from the blueprint it follows, or for a gadget with no such release on record, the
+  // first commit of its own to have any files. If it is this blueprint that the gadget took
+  // the release from, that is no guess. Only a blueprint's publisher can release under its id,
+  // so its releases are versions of one thing even where they are not chained to one another,
+  // as a bundled blueprint's are not. Otherwise the base is `unverified`, unless it has no
+  // files to be wrong about or the release's history holds the very same tree.
+  async #blueprintMergeBase(upstream: GadgetUpstream | undefined, head: string, release: string,
+                            blueprintId: string)
+      : Promise<{commitId: string, files: Map<string, string>, unverified: boolean} | undefined> {
+    let common = this.gitCache.mergeBases(head, release);
+    if (common.length === 0) {
+      let commitId = upstream?.commitId ?? await this.#firstCommitWithFiles(head);
+      let files = await this.gitStore.readCommitFilesIfHeld(commitId);
+      if (files === undefined) return undefined;
+      let taken = upstream?.blueprintId === blueprintId && upstream.commitId !== undefined;
+      let unverified = !taken && files.size > 0 &&
+          !await this.#historyHoldsTree(release, await this.gitStore.commitTree(commitId));
+      return {commitId, files, unverified};
+    }
+
+    let held: {commitId: string, files: Map<string, string>, unverified: boolean}[] = [];
+    for (let commitId of common) {
+      let files = await this.gitStore.readCommitFilesIfHeld(commitId);
+      if (files !== undefined) held.push({commitId, files, unverified: false});
+    }
+    if (held.length <= 1) return held[0];
+
+    for await (let {oid} of this.gitStore.firstParentChain(release)) {
+      let inLineage = held.find(base => base.commitId === oid);
+      if (inLineage !== undefined) return inLineage;
+    }
+    let times = await Promise.all(held.map(async base =>
+        (await this.gitStore.readCommitObject(base.commitId)).committer.timestamp));
+    return held[times.indexOf(Math.max(...times))];
+  }
+
+  // The oldest commit of a gadget's own history to have any files, or the oldest of all if
+  // none has. `head` is the gadget's head.
+  async #firstCommitWithFiles(head: string): Promise<string> {
+    let emptyTree = await gitObjectOid("tree", encodeGitTree([]));
+    let first: string | undefined;
+    let root = head;
+    for await (let {oid, commit} of this.gitStore.firstParentChain(head)) {
+      root = oid;
+      if (commit.tree !== emptyTree) first = oid;
+    }
+    return first ?? root;
+  }
+
+  // Whether `commit` or any commit in its history has the tree `tree`. The whole history has
+  // to be held, as a blueprint release's is.
+  async #historyHoldsTree(commit: string, tree: string): Promise<boolean> {
+    let seen = new Set<string>();
+    let pending = [commit];
+    for (let oid of pending) {  // sees the parents pushed below
+      if (seen.has(oid)) continue;
+      seen.add(oid);
+      let object = await this.gitStore.readCommitObject(oid);
+      if (object.tree === tree) return true;
+      pending.push(...object.parent);
+    }
+    return false;
+  }
+
+  // The bindings a blueprint declares that the gadget has none named for, in the form a
+  // BlueprintMerge records them. `gadget` is absent for a gadget about to be created, which
+  // has no bindings at all.
+  #missingBlueprintBindings(metadata: BlueprintMetadata, gadget?: GadgetRecord)
+      : Pick<BlueprintMerge, "missingBindings"> {
+    let bound = new Set(gadget && this.visibleBindings(gadget).map(([name]) => name));
+    let missing = Object.entries(metadata.bindings)
+        .filter(([name, binding]) => !binding.spawnerOnly && !bound.has(name));
+    return missing.length > 0 ? {missingBindings: Object.fromEntries(missing)} : {};
   }
 
 
@@ -4415,25 +3617,37 @@ class OverseerImpl implements AgentHooks {
     let generationToken = entryCodeBase.generation;
     let revisionToken = entryCodeBase.revision;
 
-    // Get the proposed updates for the thread. Each covered gadget creation or binding addition
-    // sits on one of these "changes" messages (see addChatMessages), so an empty list also
-    // means there is nothing to promote -- unless the chat still holds a worktree pin. Today a
-    // worktree pin is established only by a modification, whose message is proposed; but chats
-    // from before that carry pins their worktree was born with or re-pinned at by an earlier
-    // accept, which are never dropped by anything else. Running the epoch reset drops them
-    // (the auto-commit planning finds the worktree clean), which is how one accept moves such a
-    // chat into the current regime.
-    let updates = this.getProposedChanges(chatId);
-    if (updates.length === 0 && !entryCodeBase.pins.some(pin => this.isWorktree(pin.gadgetId))) {
-      // Nothing to merge, so this is a no-op.
-      return {outcome: "merged"};
-    }
-
     // Message statuses drive excluding reverted creations from coverage below. The map stays
     // valid through the whole accept: the sequence-token revalidation after the awaits
     // guarantees no message was recorded since.
-    let messages = [...this.storage.chats.list({prefix: `${keyString(chatId)}.`})];
+    let messages = [...this.storage.chats.list({prefix: chatKeyPrefix(chatId)})];
     let statuses = chatChangeStatuses(messages);
+
+    // The blueprint releases the chat still proposes to merge, by gadget: those recorded on a
+    // "changes" message that is neither merged nor reverted (see
+    // AiChatMessageBody.blueprintMerges). The log is the only record of a proposal, so a revert
+    // withdraws one just by covering its message.
+    let blueprintMerges = new Map<WorkpieceId, BlueprintMerge>();
+    for (let msg of messages) {
+      if (msg.type === "changes" && statuses.get(msg.sequence) === undefined) {
+        for (let merge of msg.blueprintMerges ?? []) blueprintMerges.set(merge.gadgetId, merge);
+      }
+    }
+
+    // Whether the chat proposes anything is read from its state, never from its changes: a
+    // pin, a gadget or binding edge pending in it (which is what the UI goes by, see
+    // proposedChangeWorkpieceIds), or a surviving blueprint proposal. The changes can't say: a
+    // re-root leaves a pin at a merge commit as the whole proposal, with no change recorded
+    // anywhere, and a compaction checkpoint keeps nothing of a proposal that changes no file.
+    // Once the sweep above has run, a pin exists only while a surviving message of the epoch
+    // declares it, so this agrees with the log. (A chat from before worktree pins meant
+    // modification can hold a worktree pin that proposes nothing; the epoch reset below drops
+    // it -- the auto-commit planning finds the worktree clean -- which is how one accept moves
+    // such a chat into the current regime.)
+    if (this.proposedChangeWorkpieceIds(chatId, meta).length === 0 && blueprintMerges.size === 0) {
+      // Nothing to merge, so this is a no-op.
+      return {outcome: "merged"};
+    }
 
     // A pending record (or edge) whose stamp the log already marks reverted is dead, not
     // covered: it survives only because a revert's awaited record deletion failed (see
@@ -4468,8 +3682,11 @@ class OverseerImpl implements AgentHooks {
 
     // `baseHead` snapshots the head this accept fast-forwards from (also the value the post-await
     // revalidation compares against -- a primitive, so it can't be confused by whatever object
-    // the storage layer hands back later).
-    let toCommit: {record: GadgetRecord, files: Map<string, string>, baseHead?: string}[] = [];
+    // the storage layer hands back later). `parent` is the commit the new head is written on,
+    // or becomes when nothing needs writing (`reuseParent`); `release` is a release the parent's
+    // history lacks, which the new commit merges.
+    let toCommit: {record: GadgetRecord, files: Map<string, string>, baseHead?: string,
+                   parent?: string, reuseParent: boolean, release?: string}[] = [];
     for (let record of Array.from(this.storage.gadgets.list())) {
       if (record.type === "worktree") {
         // Worktrees never gate an accept and get no head-commit work here: their content stays
@@ -4487,7 +3704,8 @@ class OverseerImpl implements AgentHooks {
         continue;
       }
       let files = chatContent.get(record.id) ?? new Map<string, string>();
-      let mergedCommit = pins.get(record.id)?.mergedCommit;
+      let pin = pins.get(record.id);
+      let mergedCommit = pin?.mergedCommit;
       let baseFiles = mergedCommit !== undefined
           ? await this.gitStore.readCommitFiles(mergedCommit)
           : new Map<string, string>();
@@ -4496,7 +3714,18 @@ class OverseerImpl implements AgentHooks {
       // no files yet -- so promotion below can give every accepted gadget a head. Coverage must
       // never be inferred from content equality: an empty gadget compares equal to the empty
       // base, which is how creations used to be dropped from accepts.
-      if (filesEqual(files, baseFiles) && !record.pending) continue;
+      //
+      // Nor may a gadget be skipped if the chat proposes merging a blueprint release that its
+      // history does not hold yet. The commit is what records the merge, changed files or not:
+      // without it the next update from that blueprint would be merged against the wrong base.
+      // (Such a gadget is always pinned, or pending here: see applyBlueprint and the agent's
+      // createGadget.)
+      let release = blueprintMerges.get(record.id)?.commitId;
+      if (release !== undefined && record.commitId !== undefined &&
+          this.gitCache.isAncestor(release, record.commitId)) {
+        release = undefined;
+      }
+      if (filesEqual(files, baseFiles) && !record.pending && release === undefined) continue;
 
       // Accepting is only ever a fast-forward: the chat must have already merged the gadget's
       // current head. A stale chat is expected control flow (someone else's accept can land at
@@ -4505,23 +3734,71 @@ class OverseerImpl implements AgentHooks {
       if (record.commitId !== mergedCommit) {
         return {outcome: "stale"};
       }
-      toCommit.push({record, files, baseHead: record.commitId});
+
+      // The new head's parent. A pin re-rooted at a merge commit not yet accepted -- one whose
+      // first parent is the head the chat merged -- fast-forwards through that commit, so the
+      // merge stays in the gadget's history. Any other pin (one that never moved, or one that an
+      // update from before re-roots advanced past its base) commits on the head itself.
+      let parent = mergedCommit;
+      if (pin !== undefined && pin.baseCommit !== pin.mergedCommit &&
+          (await this.gitStore.readCommitObject(pin.baseCommit)).parent[0] === pin.mergedCommit) {
+        parent = pin.baseCommit;
+      }
+
+      // If the chat's files are the parent's own and the parent's history holds every release
+      // proposed, the parent itself becomes the head and nothing is written: an accept with no
+      // edits after a merge makes the merge commit the head.
+      let parentRelease = release;
+      if (parent !== mergedCommit) {
+        if (parentRelease !== undefined && this.gitCache.isAncestor(parentRelease, parent!)) {
+          parentRelease = undefined;
+        }
+        baseFiles = await this.gitStore.readCommitFiles(parent!);
+      }
+      let reuseParent = parent !== undefined && parentRelease === undefined &&
+          filesEqual(files, baseFiles);
+      toCommit.push({record, files, baseHead: record.commitId, parent, reuseParent,
+                     release: parentRelease});
     }
 
     // Write the commits (content-addressed object writes; harmless if the accept below turns out
     // stale after all).
     let identity = commitIdentityForAuthor(userMeta.profile);
     let commits: {gadgetId: WorkpieceId, commitId: string}[] = [];
-    for (let {record, files, baseHead} of toCommit) {
-      commits.push({
-        gadgetId: record.id,
-        commitId: await this.gitStore.writeFilesAsCommit(files, {
-          parents: baseHead !== undefined ? [baseHead] : [],
+    for (let {record, files, parent, reuseParent, release} of toCommit) {
+      if (reuseParent) {
+        commits.push({gadgetId: record.id, commitId: parent!});
+        continue;
+      }
+      let parents = parent !== undefined ? [parent] : [];
+      if (release !== undefined) {
+        // A merged release is never the first parent, which is the gadget's own previous
+        // state. A gadget that has none starts from an empty root, as one instantiated outside
+        // any chat does (see initializeFromBlueprint). The commit marks the release as merged,
+        // which is what tells it from any other parent (see releasesMergedSince).
+        if (parent === undefined) {
+          parents.push(await this.gitStore.writeFilesAsCommit(new Map(), {
+            parents: [],
+            author: identity,
+            message: `Create gadget: ${record.title}`,
+            timestamp: new Date(),
+          }));
+        }
+        parents.push(release);
+      }
+      let commitId: string;
+      try {
+        commitId = await this.gitStore.writeFilesAsCommit(files, {
+          parents,
           author: identity,
           message: `Accept changes from chat: ${meta.title}`,
           timestamp: new Date(),
-        }),
-      });
+          headers: release !== undefined ? [releaseMergeHeader(release)] : undefined,
+        });
+      } catch (err) {
+        throw acceptWriteError(record.bindingName, err);
+      }
+      commits.push({gadgetId: record.id, commitId});
     }
 
     // Plan the worktree accepts: the commit each pinned worktree's accepted commit
@@ -4551,7 +3828,12 @@ class OverseerImpl implements AgentHooks {
           let files = chatContent.get(pin.gadgetId);
           let changes = new Map<string, string | null>();
           for (let path of touched) changes.set(path, files?.get(path) ?? null);
-          let flattened = await this.gitStore.writeChangedTree(record.pinBase, changes);
+          let flattened: string;
+          try {
+            flattened = await this.gitStore.writeChangedTree(record.pinBase, changes);
+          } catch (err) {
+            throw acceptWriteError(record.title, err);
+          }
           if (flattened !== await this.gitStore.commitTree(record.pinBase)) {
             newPinBase = flattened === await this.gitStore.commitTree(record.headCommit)
                 ? record.headCommit
@@ -4650,6 +3932,16 @@ class OverseerImpl implements AgentHooks {
       let record = this.storage.gadgets.get(gadgetId)!;
       if (record.type !== "gadget") continue;  // unreachable: only gadgets are committed
       record.commitId = commitId;
+      this.storage.gadgets.put(record);
+    }
+
+    // Each gadget the chat proposed merging a blueprint release into now follows that
+    // blueprint, at that release, which its head's history holds: from just above, or from
+    // before. (A gadget whose creation this merge did not cover is no part of it.)
+    for (let [gadgetId, {blueprintId, commitId}] of blueprintMerges) {
+      let record = this.storage.gadgets.get(gadgetId);
+      if (record?.type !== "gadget" || record.pending) continue;
+      record.upstream = {blueprintId, commitId};
       this.storage.gadgets.put(record);
     }
 
@@ -4809,7 +4101,7 @@ class OverseerImpl implements AgentHooks {
     // gate: nothing can interleave between what we examine here, the "changes" messages the
     // revert message will cover, and the mutations recording the revert.
     let meta = this.assertChatNotActive(chatId);
-    let messages = [...this.storage.chats.list({prefix: `${keyString(chatId)}.`})];
+    let messages = [...this.storage.chats.list({prefix: chatKeyPrefix(chatId)})];
     let statuses = chatChangeStatuses(messages);
     let stillProposed = (msg: AiChatMessage) =>
         msg.type === "changes" && msg.sequence >= revertFrom &&
@@ -4832,16 +4124,17 @@ class OverseerImpl implements AgentHooks {
           "only be discarded together. Discard all of the chat's pending changes instead.");
     }
 
-    // A still-proposed mainline merge (see updateChatFromMainline) cannot be reverted: it
-    // advanced the chat's pins to commits whose content arrived in that very update, so erasing
-    // the update would leave the pins claiming content the chat no longer has -- and a later
-    // accept would then silently overwrite those mainline changes. Rolling pins back would need
-    // their pre-merge values, which aren't recorded; until they are, refuse loudly. (An
-    // *accepted* mainline merge is untouched by reverts, so it doesn't block anything. Scanned
-    // over canonical history rather than getProposedChanges, whose compacted-prefix batch hides
+    // A still-proposed mainline merge that records no `gadgets` cannot be reverted: it advanced
+    // the chat's pins to commits whose content arrived in that very update, so erasing the
+    // update would leave the pins claiming content the chat no longer has -- and a later accept
+    // would then silently overwrite those mainline changes. Rolling the pins back needs their
+    // pre-merge values, which only a merge that records `gadgets` keeps (see the pin settlement
+    // below). (An *accepted* mainline merge is untouched by reverts, so it doesn't block
+    // anything. Scanned over canonical history, since a compaction checkpoint keeps no trace of
     // individual messages.)
     for (let msg of messages) {
-      if (msg.type === "changes" && msg.mainlineMerge !== undefined && stillProposed(msg)) {
+      if (msg.type === "changes" && msg.mainlineMerge !== undefined &&
+          msg.mainlineMerge.gadgets === undefined && stillProposed(msg)) {
         throw new Error("Cannot revert changes that include an update from mainline: the " +
             "update brought in other chats' accepted work, which the revert would silently " +
             "discard. Edit or revert the files directly instead.");
@@ -4883,7 +4176,7 @@ class OverseerImpl implements AgentHooks {
 
     let timestamp = this.getChatTimestamp();
 
-    this.storage.chats.put({
+    let revertMessage: AiChatMessage = {
       chatId,
       sequence: this.nextChatSequence(chatId),
       timestamp,
@@ -4891,18 +4184,39 @@ class OverseerImpl implements AgentHooks {
 
       type: "revert",
       revertFrom,
-    });
+    };
+    this.storage.chats.put(revertMessage);
 
-    // Roll back pins: a pin survives the revert iff its declaring message survives.
-    // `declaredPinGadgets` reads the log as it now stands -- including the revert message just
-    // written -- so pins declared only by reverted messages drop out, as do meta-only pins with
-    // no logged declaration at all (established by rows that never materialized: those rows die
-    // below, and nothing else roots in their bases). Unlike mergedCommit advancement -- whose
-    // prior value is unrecorded, hence the mainlineMerge refusal above -- a declared pin's
-    // prior state is trivially "unpinned".
+    // Settle the pins, one record per field. `declaredPins` reads the log as it now stands --
+    // including the revert message just written -- so a pin's base is its last surviving
+    // declaration's, which a reverted re-root hands back to the declaration before it. Pins
+    // declared only by reverted messages drop out, as do meta-only pins with no logged
+    // declaration at all (established by rows that never materialized: those rows die below,
+    // and nothing else roots in their bases).
+    //
+    // `mergedCommit` goes back to what the earliest reverted update from mainline records it
+    // was before (MainlineMergeGadget.baseCommit), and nothing else moves it. Not the
+    // surviving declaration's `mergedCommit`: an update from before re-roots advanced the pin
+    // without declaring anything, so the declaration can be behind the content the chat still
+    // holds, and the next update would merge against too old a base.
     let codeBase = this.chatCodeBase(meta);
-    let declared = this.declaredPinGadgets(chatId);
-    codeBase.pins = codeBase.pins.filter(pin => declared.has(pin.gadgetId));
+    let declared = this.declaredPins(chatId);
+    let mergedBefore = new Map<WorkpieceId, string>();
+    for (let msg of messages) {
+      if (msg.type !== "changes" || !stillProposed(msg)) continue;
+      for (let {gadgetId, baseCommit} of msg.mainlineMerge?.gadgets ?? []) {
+        if (!mergedBefore.has(gadgetId)) mergedBefore.set(gadgetId, baseCommit);
+      }
+    }
+    codeBase.pins = codeBase.pins.flatMap(pin => {
+      let declaration = declared.get(pin.gadgetId);
+      if (declaration === undefined) return [];
+      return [{
+        gadgetId: pin.gadgetId,
+        baseCommit: declaration.baseCommit,
+        mergedCommit: mergedBefore.get(pin.gadgetId) ?? pin.mergedCommit,
+      }];
+    });
 
     // Roll back worktree heads: a revert covering a `worktreeCommits`-bearing message returns
     // each affected worktree's head to the *earliest* reverted advancement's previousHead --
@@ -4941,7 +4255,7 @@ class OverseerImpl implements AgentHooks {
     meta.codeBase = codeBase;
 
     meta.lastActive = timestamp;
-    this.rollbackChatCompaction(meta, revertFrom);
+    this.refoldChatCompactions(chatId, revertFrom, [...messages, revertMessage]);
     this.storage.chatMeta.put(meta);
     this.proposedChangesChanged(chatId);
 
@@ -4975,7 +4289,7 @@ class OverseerImpl implements AgentHooks {
     // erased base. (The per-client dedupe records survive -- see submitCodeChange: a straggling
     // retry of an erased row is still acknowledged with its recorded landing spot instead of
     // being applied twice.)
-    let declared = this.declaredPinGadgets(chatId);
+    let declared = this.declaredPins(chatId);
     codeBase.pins = codeBase.pins.filter(pin => declared.has(pin.gadgetId));
     this.deleteAllChatChanges(chatId);
     codeBase.generation += 1;
@@ -5355,9 +4669,20 @@ class OverseerImpl implements AgentHooks {
     }
   }
 
-  // `cls` is for the one caller that has the class in hand but has deliberately not published the
-  // record yet (`addGatekeeper`); everyone else resolves it from the record.
-  getGatekeeperFacet(id: number, cls?: GatekeeperClass): Fetcher<Gatekeeper<any>> {
+  // Every stub to a gatekeeper facet is minted through ctx.restore(), for the reason given at
+  // getGadgetFacetFetcher(): it lets the gatekeeper call its own ctx.restore() to mint persistent
+  // stubs to itself, e.g. a target its push handler delivers events through. The exception is
+  // `cls`, for the one caller that has the class in hand but has deliberately not published the
+  // record yet (`addGatekeeper`): [restore]() would find no record, so it gets the raw facet.
+  async getGatekeeperFacet(id: number, cls?: GatekeeperClass): Promise<Fetcher<Gatekeeper<any>>> {
+    if (cls) return this.#getGatekeeperFacetRaw(id, cls);
+    return await this.ctx.restore(  // validates the gatekeeper exists, in [restore]()
+        {type: "gatekeeper", gatekeeperId: id} satisfies OverseerRestoreParams);
+  }
+
+  // The bare facet stub behind getGatekeeperFacet(): a request made on it leaves the facet unable
+  // to call its own ctx.restore().
+  #getGatekeeperFacetRaw(id: number, cls?: GatekeeperClass): Fetcher<Gatekeeper<any>> {
     return this.ctx.facets.get(`gatekeeper${id}`, async () => {
       let resolved = cls ?? this.storage.gatekeepers.get(id)?.class;
       if (!resolved) {
@@ -5369,8 +4694,7 @@ class OverseerImpl implements AgentHooks {
 
   // The git cache's pull delegate (see GitPullDelegate): reaches the gatekeeper through its
   // instantiated facet -- the same path every other invocation of an existing gatekeeper uses --
-  // and hands it a cache stub scoped to itself, so everything it put()s or advertises is
-  // attributed to it.
+  // and ingests its pack with that source's provenance and the DO cache's existing limits.
   async #pullGitObjects(gatekeeperId: WorkpieceId, oids: string[], hints: GitPullHints)
       : Promise<void> {
     if (this.storage.gatekeepers.get(gatekeeperId) === undefined) {
@@ -5381,9 +4705,29 @@ class OverseerImpl implements AgentHooks {
     // gitPull is optional on Gatekeeper; view the facet through the same Required<Pick<...>>
     // pattern as CatalogGatekeeperFacet. A gatekeeper that doesn't implement it rejects the
     // call, which the pull driver treats as this source failing.
-    let facet = this.getGatekeeperFacet(gatekeeperId) as unknown as
+    let facet = await this.getGatekeeperFacet(gatekeeperId) as unknown as
         Fetcher<Gatekeeper<any> & Required<Pick<Gatekeeper<any>, "gitPull">>>;
-    await facet.gitPull(oids, new GitCacheImpl(this.gitCache, gatekeeperId), hints);
+    using transfer = await facet.gitPull(oids, hints);
+    const pack = await transfer.stream();
+    let stored: Set<string>;
+    try {
+      stored = new Set(await this.gitCache.consumePackFromGatekeeper(gatekeeperId, pack));
+    } catch (error) {
+      // A stream exception crossing Workers RPC can turn into "Network connection lost".
+      // The producer records its real protocol error before rejecting the stream.
+      const status = await transfer.status().catch(() => undefined);
+      if (status?.state === "failed") throw new Error(status.message, {cause: error});
+      throw error;
+    }
+    const status = await transfer.status();
+    if (status.state === "failed") throw new Error(status.message);
+    if (status.state !== "complete") {
+      throw new Error(`git fetch ended without a completed transfer (${status.state})`);
+    }
+    const missing = oids.filter(oid => !stored.has(oid));
+    if (missing.length > 0 && !(hints.type === "blob" && hints.filterBlobSize !== undefined)) {
+      throw new Error(`git fetch did not provide the requested objects: ${missing.join(", ")}`);
+    }
   }
 
   // Apply a single pending action: invoke the gatekeeper, mark it approved, and persist (the put
@@ -5395,18 +4739,49 @@ class OverseerImpl implements AgentHooks {
   // gate was cleared: this is the single chokepoint where an action transitions to "approved", so
   // requiring them here guarantees the audit log always records the resolving user and whether it
   // was applied automatically. For an auto-approval, `resolvedBy` is the user who enabled the rule.
+  // A creation also needs `creation`: the verifier of the account the approver chose to create it
+  // in, and what they chose in that account's creation configurator.
   async applyPendingAction(record: ActionRecord & {type: "action"},
-                           resolvedBy: AiChatAuthorInfo, autoApproved: boolean): Promise<void> {
-    let gatekeeper = this.getGatekeeperFacet(record.gatekeeperId);
-    // The apply-time cache stub is scoped to the gatekeeper AND to this action (approval can
-    // happen long after the session that queued it, so the queue-time stub is gone) -- the
-    // binding that makes buildPack() serve exactly this action's pending-push closure.
-    await gatekeeper.applyAction(record.action,
-        new GitCacheImpl(this.gitCache, record.gatekeeperId, record.id));
+                           resolvedBy: AiChatAuthorInfo, autoApproved: boolean,
+                           creation?: {creator: Fetcher<GatekeeperUserVerifier>,
+                                       configuration: string | null}): Promise<void> {
+    let id = record.gatekeeperId;
+    // A created resource exists only once its creation applies, and that stays pending until then.
+    if (record.action !== "create" && this.#creationPending(id)) {
+      throw new Error("This resource doesn't exist yet. Approve its creation first.");
+    }
+    let gatekeeper = await this.getGatekeeperFacet(record.gatekeeperId);
+    let created: {class: GatekeeperClass, resourceUrl: string} | undefined;
+    if (record.action === "create") {
+      if (!creation) throw new Error("Choose one of your accounts to create this resource in.");
+      // applyCreation is optional on Gatekeeper; GatekeeperVendor.createResource()'s gatekeepers
+      // implement it.
+      created = await (gatekeeper as unknown as Fetcher<Gatekeeper<any> &
+          Required<Pick<Gatekeeper<any>, "applyCreation">>>)
+          .applyCreation(creation.creator, creation.configuration);
+    } else {
+      // The apply-time cache stub is scoped to the gatekeeper AND to this action (approval can
+      // happen long after the session that queued it, so the queue-time stub is gone) -- the
+      // binding that makes buildPack() serve exactly this action's pending-push closure.
+      await gatekeeper.applyAction(record.action,
+          new GitCacheImpl(this.gitCache, record.gatekeeperId, record.id));
+    }
     record.state = "approved";
     record.appliedAt = new Date();
     record.resolvedBy = resolvedBy;
     record.autoApproved = autoApproved;
+    // A creation switches the gatekeeper to the real resource's class in the same durable step
+    // that records the approval. (Re-read: the connection may have been removed meanwhile, which
+    // leaves the card's URL as the only pointer to the created resource.)
+    if (created) record.resourceUrl = created.resourceUrl;
+    let gatekeeperRecord = created && this.storage.gatekeepers.get(id);
+    if (created && gatekeeperRecord) {
+      gatekeeperRecord.class = created.class;
+      gatekeeperRecord.resourceUrl = created.resourceUrl;
+      if (gatekeeperRecord.creationSpec?.type === "gatekeeper") {
+        gatekeeperRecord.creationSpec.resourceUrl = created.resourceUrl;
+      }
+    }
     // One durable step for the completion record and the mark conversion (pushed objects are
     // now proven on the remote), so a crash between the push and here strands nothing locally
     // -- the remote side of that window is the gatekeeper's applyAction idempotency
@@ -5414,7 +4789,18 @@ class OverseerImpl implements AgentHooks {
     this.storage.transaction(() => {
       this.gitCache.convertPushMarksToOnRemote(record.id);
       this.storage.actions.put(record);
+      if (gatekeeperRecord) this.storage.gatekeepers.put(gatekeeperRecord);
     });
+    if (gatekeeperRecord) {
+      // Restart the facet on the new class before anything else reaches it.
+      this.ctx.facets.abort(`gatekeeper${id}`,
+          new Error("Connection restarted because its resource was created."));
+      // Minting skipped addGatekeeper's restart: collaborators had no real resource to be
+      // verified against until now (see createExternalResource).
+      if (this.#restartIfSessionsAffected("Gadget restarted because a resource was created.")) {
+        this.#gatekeepersPendingRestart.add(id);
+      }
+    }
     // Also when a rule applies it: a user's "always approve" answers a pending request that way.
     this.traceAgentActionApproval(record, "approved");
   }
@@ -5492,7 +4878,7 @@ class OverseerImpl implements AgentHooks {
     // input gate is open across the await, ids are allocated sequentially, so a live build session
     // can guess this one, and getGatekeeperById (OverseerClientInterface) gates on nothing but
     // existence.
-    let facet = this.getGatekeeperFacet(id, cls);
+    let facet = await this.getGatekeeperFacet(id, cls);
     try {
       let description = await facet.describe();
       gatekeeperRecord.resourceTitle = description.title;
@@ -5527,7 +4913,8 @@ class OverseerImpl implements AgentHooks {
       }
     }
 
-    return new GatekeeperClientImpl<any>(this, id, facet, actorUserId, joinAs);
+    return new GatekeeperClientImpl<any>(
+        this, id, await this.getGatekeeperFacet(id), actorUserId, joinAs);
   }
 
   // Destroy a gatekeeper (connection) workpiece. Any binding edges pointing at it are severed so
@@ -5594,7 +4981,8 @@ class OverseerImpl implements AgentHooks {
       }
 
       case "gatekeeper":
-        return this.openGatekeeperSession(target.id, this.getGatekeeperFacet(target.id), caller);
+        return this.getGatekeeperFacet(target.id)
+            .then(facet => this.openGatekeeperSession(target.id, facet, caller));
 
       case "worktree": {
         // The programmatic Worktree binding (worktree-session.ts). A worktree's uncommitted
@@ -5642,7 +5030,7 @@ class OverseerImpl implements AgentHooks {
   async #gitAuthorFor(caller: GatekeeperCaller): Promise<AiChatAuthorInfo> {
     let turn = caller.from === "agent" ? this.#activeWorktreeTurns.get(caller.chatId) : undefined;
     if (turn !== undefined) return turn.initiator;
-    return this.gadgetAuthorFor(await retryOnDoReset(() => this.#ownerUserDo().whoami(), this.logger));
+    return this.gadgetAuthorFor(await retryOnDoReset(() => this.ownerUserDo().whoami(), this.logger));
   }
 
   // The author of work this workspace's gadgets do on `user`'s behalf -- spawned agent turns,
@@ -5779,12 +5167,12 @@ class OverseerImpl implements AgentHooks {
   // Prepare a stored chat message for delivery to a client: inline image attachment bytes
   // (non-image attachments are fetched on demand via getChatAttachmentContent()), strip the
   // retired Yjs payload from pre-conversion "changes" messages -- it is kept on disk as
-  // rollback insurance (see git-migration.ts) but nothing can apply it, so it must not ship as
-  // dead weight on the wire (it is not part of the message's API type).
-  hydrateChatMessageForClient(msg: AiChatMessage): AiChatMessage {
+  // rollback insurance (see overseer-git-migration.ts) but nothing can apply it, so it must not
+  // ship as dead weight on the wire (it is not part of the message's API type).
+  hydrateChatMessageForClient(msg: StoredChatMessage): AiChatMessage {
     if (msg.type === "changes" && "update" in msg) {
-      let {update: _, ...rest} = msg as AiChatMessage & {update?: Uint8Array};
-      msg = rest as AiChatMessage;
+      let {update: _, ...rest} = msg;
+      msg = rest;
     }
     if (msg.type !== "message" || !msg.attachments?.length) return msg;
     let attachments = msg.attachments.map((a) => {
@@ -5987,7 +5375,7 @@ class OverseerImpl implements AgentHooks {
     this.#associateAction(caller, actionId);
   }
 
-  async submitAction(gatekeeperId: number, action: number,
+  async submitAction(gatekeeperId: number, action: number | "create",
                      description: ActionDescription, caller: GatekeeperCaller)
       : Promise<void> {
     // An in-flight facet RPC can outlive removeGatekeeper, and a pending action on a removed
@@ -6188,6 +5576,7 @@ class OverseerImpl implements AgentHooks {
         event: "gadget.last.active.bump.failed",
         gadgetId: this.ctx.id.toString(), error: err,
       });
+      this.restartIfLoopLimited(err);
 
       // Force retry on next bump.
       this.#lastActiveTimeKnownToUserDo = undefined;
@@ -6267,6 +5656,7 @@ class OverseerImpl implements AgentHooks {
       this.logger.warn("failed to sync workspace outputs to user DO", {
         event: "workspace.outputs.sync.failed", gadgetId: this.ctx.id.toString(), error: err,
       });
+      this.restartIfLoopLimited(err);
       return false;
     }
   }
@@ -6345,6 +5735,9 @@ class OverseerImpl implements AgentHooks {
   // - Verification scope widened (see #restartIfSessionsAffected): a collaborator's live session
   //   was verified against a smaller set of gatekeepers than the workspace now holds.
   //
+  // A third use changes nobody's entitlement (see restartIfLoopLimited): the restart replaces this
+  // instance, and with it the exhausted loop counter that was refusing its calls to user objects.
+  //
   // We restart by aborting the whole DO. Aborting propagates to clients: the `notifyClosed` stub
   // handed to each session is disposed without being called, which AuthenticatedApiImpl detects
   // and reacts to by killing the browser WebSocket, forcing a reconnect that re-runs open() and
@@ -6366,6 +5759,34 @@ class OverseerImpl implements AgentHooks {
     await this.ctx.storage.sync();
     await scheduler.wait(100);
     this.ctx.abort(reason);
+  }
+
+  // Whether restartIfLoopLimited has scheduled a restart of this instance.
+  #loopLimitRestartScheduled = false;
+
+  // Restart if `err` is the runtime's loop-limit rejection (see isLoopLimitError) of one of this
+  // object's own calls to a user object: once its outgoing channels hold an exhausted counter
+  // every such call is refused until this instance is replaced. Only rejections of those calls are
+  // passed in (wrapUserDo's stubs, the last-active bump and the outputs sync) -- code the workspace
+  // runs or calls (gadgets, agents, gatekeeper facets) can throw the same message at will, and
+  // must not be able to restart a shared workspace. A rejection the user object relays whole from
+  // something it called, such as a connected gatekeeper account, cannot be told apart and counts.
+  // At most one restart per instance, and none while the instance is young: that bounds how often
+  // a restart that did not clear the condition repeats.
+  restartIfLoopLimited(err: unknown): void {
+    if (!isLoopLimitError(err) || this.#loopLimitRestartScheduled) return;
+    if (Date.now() - this.streamGeneration < LOOP_LIMIT_RESTART_MIN_AGE_MS) return;
+    this.#loopLimitRestartScheduled = true;
+    this.logger.error("restarting workspace to clear an exhausted subrequest depth", {
+      event: "workspace.loop.limit.restart", error: err,
+    });
+    this.scheduleAccessRestart("Gadget restarted because its subrequest depth was exhausted.");
+  }
+
+  // Wraps a user DO stub for reset telemetry (see wrapDoStubForTelemetry) and so that a loop-limit
+  // rejection of any call made through it restarts this instance (see restartIfLoopLimited).
+  wrapUserDo(stub: DurableObjectStub<UserDurableObject>) {
+    return wrapDoStubForTelemetry(stub, this.logger, e => this.restartIfLoopLimited(e));
   }
 
   // Connections whose scope widening scheduled a restart, blocked until the reset lands. The
@@ -6504,51 +5925,6 @@ class OverseerImpl implements AgentHooks {
     return result;
   }
 
-  // For the given chat ID, return all code changes that are still in the "proposed" state, i.e.
-  // they are neither merged nor reverted. An entry's `change` is absent for batches that record
-  // only gadget creations/binding additions (which still count as proposed changes: they are
-  // merged and reverted like code edits).
-  //
-  // The compacted prefix seeds one entry, addressed at the last sequence it covers, so a single
-  // merge through it accepts everything before the boundary. `endBefore` must stay at or above that
-  // boundary: below it the prefix has already folded away batches a full scan would still report.
-  getProposedChanges(chatId: number, endBefore?: number): ChangeBatch[] {
-    let checkpoint = this.getActiveChatCompaction(chatId);
-    let seed: ChangeBatch[] = [];
-    if (checkpoint) {
-      // A creation-only prefix has no change to carry, so the registry rows it left behind are what
-      // reveal it (see CompactionCheckpoint.proposedChange).
-      if (checkpoint.proposedChange || this.#hasPendingStructure(chatId, checkpoint.compactedTo)) {
-        seed.push({sequence: checkpoint.compactedTo - 1, change: checkpoint.proposedChange});
-      }
-    }
-    return foldProposedChanges(
-        this.storage.chats.list({
-          prefix: `${keyString(chatId)}.`,
-          start: checkpoint && compactionKey(chatId, checkpoint.compactedTo),
-          end: endBefore === undefined ? undefined : compactionKey(chatId, endBefore),
-        }),
-        seed);
-  }
-
-  // Whether the chat still owns a provisional gadget or binding edge recorded before `compactedTo`.
-  // Those carry no Y.Doc update, so this is how a creation-only compacted prefix stays visible as a
-  // proposed change.
-  #hasPendingStructure(chatId: number, compactedTo: number): boolean {
-    for (let gadget of this.storage.gadgets.list()) {
-      // Worktrees have no binding edges, and their creation proposes nothing.
-      if (gadget.type !== "gadget") continue;
-      let stamped = (pending: {chatId: number, sequence?: number} | undefined) =>
-          pending?.chatId === chatId && pending.sequence !== undefined &&
-          pending.sequence < compactedTo;
-      if (stamped(gadget.pending)) return true;
-      for (let edge of Object.values(gadget.bindings)) {
-        if (stamped(edge.pending)) return true;
-      }
-    }
-    return false;
-  }
-
   // Get the sequence number that should be assigned to the next message in the given chat thread.
   nextChatSequence(chatId: number): number {
     let result = this.storage.nextChatSequences.get(chatId)?.nextSequence || 0;
@@ -6626,13 +6002,13 @@ class OverseerImpl implements AgentHooks {
       // The id is client-supplied, so a connection blocked pending a scope-widening restart must
       // be refused here: the invoke below reads the connection AND mints an observation, both on
       // behalf of a session the reset is about to sever.
+      let facet = await this.getGatekeeperFacet(gatekeeperId);
       this.assertGatekeeperUsable(gatekeeperId);
       // Display-only, and from the browser, so a bad value is dropped rather than refused.
       message = {...message, commandPosition: sanitizeCommandPosition(message)};
       using authorizer = new NativeRpcStub<ObservationAuthorizer>(
           new SlashCommandAuthorizerImpl(this, gatekeeperId, {from: "user"}));
-      let result = await invokeSlashCommand(
-          this.getGatekeeperFacet(gatekeeperId), message, authorizer);
+      let result = await invokeSlashCommand(facet, message, authorizer);
       if (result.message === undefined) {
         return {slashCommand: message, skillName: result.skillName};
       }
@@ -6927,8 +6303,8 @@ class OverseerImpl implements AgentHooks {
 
     // Chat storage is a single ordered table for all threads; each key starts with the chat ID.
     let messagesAfterPrompt = [...this.storage.chats.list({
-      prefix: `${keyString(chatId)}.`,
-      startAfter: `${keyString(chatId)}.${keyString(response.promptSequence)}`,
+      prefix: chatKeyPrefix(chatId),
+      startAfter: chatKey(chatId, response.promptSequence),
     })];
     let nextUserMessageIndex = messagesAfterPrompt.findIndex(
       message => message.type === "message" && message.author.type === "user",
@@ -7053,7 +6429,7 @@ class OverseerImpl implements AgentHooks {
   }
 
   async describeGatekeeper(name: string, gatekeeper: GatekeeperRecord): Promise<string> {
-    let facet = this.getGatekeeperFacet(gatekeeper.id);
+    let facet = await this.getGatekeeperFacet(gatekeeper.id);
 
     let desc = await facet.describe();
     let types = await facet.getTypeScriptTypes();
@@ -7091,7 +6467,7 @@ class OverseerImpl implements AgentHooks {
   getActiveChatCompaction(chatId: number): CompactionCheckpoint | undefined {
     let compactedTo = this.storage.chatMeta.get(chatId)?.compactedTo;
     return compactedTo === undefined
-        ? undefined : this.storage.chatCompactions.get(compactionKey(chatId, compactedTo));
+        ? undefined : this.storage.chatCompactions.get(chatKey(chatId, compactedTo));
   }
 
   // Returns the newest checkpoint whose boundary is strictly below `sequence`, for paging history
@@ -7101,8 +6477,8 @@ class OverseerImpl implements AgentHooks {
     // bound would select records instead of none.
     if (sequence <= 0) return undefined;
     for (let checkpoint of this.storage.chatCompactions.list({
-      prefix: `${keyString(chatId)}.`,
-      end: compactionKey(chatId, sequence),
+      prefix: chatKeyPrefix(chatId),
+      end: chatKey(chatId, sequence),
       reverse: true,
       limit: 1,
     })) {
@@ -7111,8 +6487,8 @@ class OverseerImpl implements AgentHooks {
     return undefined;
   }
 
-  // Returns the newest checkpoint whose boundary is at or before `sequence`. Rollback uses the
-  // inclusive bound because a checkpoint at `revertFrom` covers only unaffected earlier messages.
+  // Returns the newest checkpoint whose boundary is at or before `sequence`. A revert's refold uses
+  // the inclusive bound because a checkpoint at `revertFrom` covers only unaffected earlier messages.
   #getChatCompactionAtOrBefore(
       chatId: number, sequence: number): CompactionCheckpoint | undefined {
     return this.getChatCompactionBelow(chatId, sequence + 1);
@@ -7125,8 +6501,8 @@ class OverseerImpl implements AgentHooks {
     return {
       checkpoint,
       chatMessages: [...this.storage.chats.list({
-        prefix: `${keyString(chatId)}.`,
-        start: checkpoint && compactionKey(chatId, checkpoint.compactedTo),
+        prefix: chatKeyPrefix(chatId),
+        start: checkpoint && chatKey(chatId, checkpoint.compactedTo),
       })],
       measuredTokens: this.getChatMetaOrThrow(chatId).totalTokens ?? 0,
     };
@@ -7137,8 +6513,8 @@ class OverseerImpl implements AgentHooks {
   //
   // Safe to call after the summary's model I/O even though that releases the input gate: the turn
   // that produced this checkpoint is still the chat's active agent, and every operation that could
-  // invalidate it -- merge, revert, and the rollback a revert triggers -- refuses while a turn is
-  // active. So the checkpoint cannot be stale by the time it lands.
+  // invalidate it -- merge and revert -- refuses while a turn is active. So the checkpoint cannot
+  // be stale by the time it lands.
   commitChatCompaction(chatId: number, checkpoint: CompactionCheckpoint): void {
     this.ctx.storage.transactionSync(() => {
       let meta = this.storage.chatMeta.get(chatId);
@@ -7152,29 +6528,25 @@ class OverseerImpl implements AgentHooks {
     });
   }
 
-  // Points the chat at the newest checkpoint a revert leaves intact. A revert erases Yjs history from
-  // `revertFrom` onward, so any checkpoint that folded in those changes can never be replayed again
-  // and is deleted; earlier ones stay, which is what lets a revert cross a boundary at all.
-  rollbackChatCompaction(meta: AiChatMetadata, revertFrom: number): void {
-    // Buffer the keys first: deleting invalidates the list cursor.
-    let stale = Array.from(
-        this.storage.chatCompactions.list({
-          prefix: `${keyString(meta.id)}.`,
-          start: compactionKey(meta.id, revertFrom + 1),
-        }),
-        checkpoint => compactionKey(meta.id, checkpoint.compactedTo));
-    for (let key of stale) this.storage.chatCompactions.delete(key);
-
-    let previousBoundary = meta.compactedTo;
-    let checkpoint = this.#getChatCompactionAtOrBefore(meta.id, revertFrom);
-    if (checkpoint) {
-      meta.compactedTo = checkpoint.compactedTo;
-    } else {
-      delete meta.compactedTo;
-    }
-    if (meta.compactedTo !== previousBoundary) {
-      // Replay now starts further back, so the prompt is longer than the recorded total describes.
-      delete meta.totalTokens;
+  // Refolds each checkpoint a revert reaches into, oldest first, from the one before it. A revert
+  // changes what the chat proposes, not what was said, so a checkpoint keeps its boundary and
+  // summary and only the code state foldCompactedCode derives from the log changes. `messages` is
+  // the chat's whole log, the revert included.
+  refoldChatCompactions(chatId: number, revertFrom: number, messages: AiChatMessage[]): void {
+    let previous = this.#getChatCompactionAtOrBefore(chatId, revertFrom);
+    // Buffer the checkpoints first: rewriting them while listing would disturb the cursor.
+    let affected = Array.from(this.storage.chatCompactions.list({
+      prefix: chatKeyPrefix(chatId),
+      start: chatKey(chatId, revertFrom + 1),
+    }));
+    for (let checkpoint of affected) {
+      let spanStart = previous?.compactedTo ?? 0;
+      previous = {
+        ...checkpoint,
+        ...foldCompactedCode(messages.filter(message => message.sequence >= spanStart),
+                             checkpoint.compactedTo, previous),
+      };
+      this.storage.chatCompactions.put(previous);
     }
   }
 
@@ -7198,12 +6570,14 @@ class OverseerImpl implements AgentHooks {
     });
 
     let liveChat = this.#getLiveChat(chatId);
-    let turn = this.#runAgentTurn(chatId, aiModel, initiator, callbackInitiated, liveChat);
+    let turn = this.#runAgentTurn(
+        chatId, aiModel, initiator, initiatorUserId, callbackInitiated, liveChat);
     if (keepAlive) this.ctx.waitUntil(turn);
   }
 
   #runAgentTurn(chatId: number, aiModel: UserAiModelRecord,
                 initiator: AiChatAuthorInfo,
+                initiatorUserId: string,
                 callbackInitiated: boolean,
                 liveChat: LiveChatContext): Promise<void> {
     return obsContext.with({
@@ -7212,17 +6586,19 @@ class OverseerImpl implements AgentHooks {
       chatId,
       modelId: aiModel.profile.id,
     }, () => this.#runAgentTurnWithContext(
-        chatId, aiModel, initiator, callbackInitiated, liveChat));
+        chatId, aiModel, initiator, initiatorUserId, callbackInitiated, liveChat));
   }
 
   async #runAgentTurnWithContext(chatId: number, aiModel: UserAiModelRecord,
                                  initiator: AiChatAuthorInfo,
+                                 initiatorUserId: string,
                                  callbackInitiated: boolean,
                                  liveChat: LiveChatContext): Promise<void> {
     // When this turn is billed to the user's own Cloudflare account, we refresh their cached credit
     // balance once the turn completes (see the `finally` below) so the next billing decision
     // reflects the spend this turn just incurred, rather than waiting for the cache TTL to lapse.
     let byokOwnerStub: DurableObjectStub<UserDurableObject> | undefined;
+    let finished = false;
     let startedAt = Date.now();
     const turnLogger = this.logger.with({
       operation: "agent.run",
@@ -7294,6 +6670,7 @@ class OverseerImpl implements AgentHooks {
 
         await runAgent(
             this, chosenModel, chatId, aiModel.profile, controller.signal, initiator, aiModel.config);
+        finished = true;
         turnLogger.debug("agent run finished", {
           event: "agent.run.finished", outcome: "ok",
           durationMs: Date.now() - startedAt,
@@ -7365,6 +6742,27 @@ class OverseerImpl implements AgentHooks {
       // re-register everything consistently.
       this.#unregisterRunningAgent(chatId);
 
+      if (finished && meta) {
+        // Classified here, past the turn's last await, so a decision made as it ended counts.
+        let awaitingDecision = this.#awaitsDecision(chatId);
+        // Only a person waits on their own turn, including one their approval resumed: callbacks
+        // and spawned agents finish unattended.
+        if (awaitingDecision || initiator.type === "user") {
+          this.ctx.waitUntil(this.users.get(this.users.idFromString(initiatorUserId))
+              .publishNotification({
+                id: crypto.randomUUID(),
+                kind: awaitingDecision ? "permissionRequested" : "taskCompleted",
+                workspaceId: this.ctx.id.toString(),
+                chatId,
+                chatTitle: meta.title,
+              }).catch(error => {
+                turnLogger.warn("notification publish failed", {
+                  event: "notification.publish.failed", error,
+                });
+              }));
+        }
+      }
+
       this.#finishAgentTurn(chatId);
     }
   }
@@ -7418,7 +6816,7 @@ class OverseerImpl implements AgentHooks {
   // Whether any calls to the chat's agent are recorded but not yet appended to its chat log.
   hasPendingAgentCalls(chatId: number): boolean {
     return Array.from(this.storage.pendingAgentCalls.list(
-        {prefix: `${keyString(chatId)}.`, limit: 1})).length > 0;
+        {prefix: chatKeyPrefix(chatId), limit: 1})).length > 0;
   }
 
   // Drain every chat that has pending calls and no running turn (a running turn drains its own
@@ -7463,7 +6861,7 @@ class OverseerImpl implements AgentHooks {
     let author: AiChatAuthorInfo | undefined;
     try {
       let [first] = Array.from(this.storage.pendingAgentCalls.list(
-          {prefix: `${keyString(chatId)}.`, limit: 1}));
+          {prefix: chatKeyPrefix(chatId), limit: 1}));
       if (!first) return;
 
       // Resolve the model and profile from the initiator of the first call, so if several calls
@@ -7472,7 +6870,7 @@ class OverseerImpl implements AgentHooks {
       // so a human sees them and the alarm isn't retrying forever. For that we need the profile
       // alone; if even that fails, the user DO itself is the problem, which is transient -- the
       // calls stay recorded and the alarm retries.
-      let user = this.users.get(this.users.idFromString(first.initiatorUserId));
+      let user = this.wrapUserDo(this.users.get(this.users.idFromString(first.initiatorUserId)));
       let userMeta: UserChatContext;
       let modelError: unknown;
       try {
@@ -7503,7 +6901,7 @@ class OverseerImpl implements AgentHooks {
       let initiatorUserId = first.initiatorUserId;
       let taken = this.chatScopeNames(chatId);
       for (let call of Array.from(this.storage.pendingAgentCalls.list(
-          {prefix: `${keyString(chatId)}.`}))) {
+          {prefix: chatKeyPrefix(chatId)}))) {
         let sequence = this.nextChatSequence(chatId);
         let bindingName = callArgsBindingName(call.methodName, name => taken.has(name));
         taken.add(bindingName);
@@ -7521,8 +6919,7 @@ class OverseerImpl implements AgentHooks {
           argsSummary: call.argsSummary,
           bindingName,
         });
-        this.storage.pendingAgentCalls.delete(
-            `${keyString(call.chatId)}.${keyString(call.callId)}`);
+        this.storage.pendingAgentCalls.deleteRecord(call);
       }
 
       if (modelError !== undefined) {
@@ -7564,6 +6961,14 @@ class OverseerImpl implements AgentHooks {
     return this.storage.chatContext.get(chatId) || {chatId};
   }
 
+  setChatWorkspacePrompt(chatId: number, workspacePrompt: string): void {
+    // The list is built asynchronously, so the chat could have been deleted meanwhile. Don't
+    // resurrect its per-chat storage (see prepareChatBindings).
+    if (this.storage.chatMeta.get(chatId)) {
+      this.storage.chatContext.put({...this.getChatAgentContext(chatId), workspacePrompt});
+    }
+  }
+
   // Summarize the workspace's gadgets for the agent: each gadget's identity and named bindings.
   // Used to build the system prompt. Gadgets still provisional to a chat other than `forChatId`
   // are omitted: they belong to that chat's proposed changes and don't exist from any other
@@ -7592,10 +6997,10 @@ class OverseerImpl implements AgentHooks {
   // Singleton gatekeepers (e.g. the Context Library), provisioned as ambient capsules
   // =======================================================================================
 
-  #ownerUserDo() {
+  // A fresh stub to the workspace owner's user DO.
+  ownerUserDo() {
     if (!this.ownerId) throw new Error("Workspace is not initialized.");
-    return wrapDoStubForTelemetry(
-        this.users.get(this.users.idFromString(this.ownerId)), this.logger);
+    return this.wrapUserDo(this.users.get(this.users.idFromString(this.ownerId)));
   }
 
   // Ensure every singleton account the gadget owner has (e.g. the Context Library) is provisioned
@@ -7611,7 +7016,7 @@ class OverseerImpl implements AgentHooks {
   async ensureAmbientCapsules(): Promise<void> {
     let ownerId = this.ownerId;
     if (!ownerId) return;
-    let ownerDo = this.#ownerUserDo();
+    let ownerDo = this.ownerUserDo();
     // listProvidedAccounts ensures the owner's auto-provisioned singleton accounts exist first, so this
     // single round trip both provisions them and reads them back before we wire up capsules.
     let accounts = (await ownerDo.listProvidedAccounts())
@@ -7650,8 +7055,9 @@ class OverseerImpl implements AgentHooks {
       try {
         let cls = await ownerDo.getSingletonGatekeeperClass(account.accountId);
         if (!cls) return;
-        // Provision as an unnamed record: it reaches the agent through each chat's env (named at
-        // seed time from the gatekeeper's suggested binding name), not as any gadget's binding.
+        // Provision as an unnamed record: it reaches the agent through each chat's env (named from
+        // the gatekeeper's suggested binding name when the chat takes it in; see
+        // prepareChatBindings), not as any gadget's binding.
         await this.addGatekeeper(
             cls,
             {type: "ambient", vendorId: account.vendorId, accountId: account.accountId},
@@ -7671,8 +7077,8 @@ class OverseerImpl implements AgentHooks {
   // enforced by the byBindingName index), then every permanent binding edge under its edge name,
   // skipping names already taken. Gadget entries therefore take precedence, and edge-name
   // collisions across gadgets resolve to the lowest gadget ID. Renames, unbinds, and deletions
-  // are reflected automatically -- no maintenance hooks -- while frozen per-chat seeds keep
-  // existing chats unaffected.
+  // are reflected automatically -- no maintenance hooks -- while per-chat seeds keep existing
+  // chats unaffected.
   defaultBindingList(): Record<string, WorkpieceId> {
     // Null prototype so binding names from before name validation existed can't collide with
     // Object.prototype members.
@@ -7691,8 +7097,8 @@ class OverseerImpl implements AgentHooks {
     return result;
   }
 
-  // Every binding name currently claimed in the given chat's scope: the frozen seed layer (or,
-  // for a chat that hasn't been seeded yet, the prospective seed it would freeze -- see
+  // Every binding name currently claimed in the given chat's scope: the seed layer (or, for a
+  // chat that hasn't been seeded yet, the prospective seed it would take -- see
   // prepareChatBindings) and the names recorded on log messages (pasted resources, live
   // connection requests, created gadgets, the arguments of delivered agent calls). Every name is
   // stamped on its message when it is claimed, so this is a plain scan. Callers that already
@@ -7708,7 +7114,7 @@ class OverseerImpl implements AgentHooks {
       // names). This may overclaim relative to eventual seeding -- which drops dangling targets
       // and allowlisted names missing from the default list -- but overclaiming is harmless for
       // the dedupe/validation this set serves.
-      let env = context.spawnerConfig.env as Record<string, WorkpieceId> | string[];
+      let env = context.spawnerConfig.env;
       taken = new Set(Array.isArray(env) ? env : Object.keys(env));
     } else {
       // Unseeded normal chat (or an old-style spawned chat with no allowlist, historically
@@ -7716,13 +7122,14 @@ class OverseerImpl implements AgentHooks {
       taken = new Set(Object.keys(this.defaultBindingList()));
     }
     taken.add(GIT_BINDING_NAME);
-    for (let msg of chatMessages ?? this.storage.chats.list({prefix: `${keyString(chatId)}.`})) {
+    for (let msg of chatMessages ?? this.storage.chats.list({prefix: chatKeyPrefix(chatId)})) {
       if (msg.type === "message") {
         for (let capsule of msg.capsules ?? []) {
           if (capsule.bindingName !== undefined) taken.add(capsule.bindingName);
         }
         for (let call of msg.toolCalls ?? []) {
-          if ((call.toolName === "createGadget" || call.toolName === "createWorktree") &&
+          if ((call.toolName === "createGadget" || call.toolName === "createWorktree" ||
+               call.toolName === "createExternalResource") &&
               call.input.bindingName !== undefined) {
             taken.add(call.input.bindingName);
           }
@@ -7791,7 +7198,7 @@ class OverseerImpl implements AgentHooks {
     try {
       // Pure read on a fresh-stub getter: safe to retry once across a user-DO reset.
       let userMeta = await retryOnDoReset(
-          () => this.#ownerUserDo().getChatContext(null), this.logger);
+          () => this.ownerUserDo().getChatContext(null), this.logger);
       return userMeta.quickModel
           ? {config: userMeta.quickModel, initiator: userMeta.profile}
           : undefined;
@@ -7803,6 +7210,22 @@ class OverseerImpl implements AgentHooks {
     }
   }
 
+  // The binding name an ambient resource takes in a chat: its gatekeeper's suggested binding name,
+  // made unique.
+  async #ambientBindingName(gatekeeperId: WorkpieceId, isTaken: (name: string) => boolean)
+      : Promise<string> {
+    let suggested: string | undefined;
+    try {
+      suggested =
+          (await (await this.getGatekeeperFacet(gatekeeperId)).describe()).suggestedBindingName;
+    } catch (err) {
+      this.logger.warn("failed to fetch suggested binding name for ambient resource", {
+        event: "chat.binding.ambient.describe.failed", gatekeeperId, error: err,
+      });
+    }
+    return fallbackBindingName(suggested || "RESOURCE", isTaken);
+  }
+
   // Prepare and return the chat's seed binding layer, including the always-available (ambient)
   // resources with their discovery catalogs. Called at agent turn start, before history replay.
   //
@@ -7811,8 +7234,9 @@ class OverseerImpl implements AgentHooks {
   //     workspace default binding list, spawned chats their frozen spawner env (resolving an
   //     old-style allowlist the same way the storage migration does). Chats created before named
   //     chat bindings are seeded here on their next turn, with zero upfront migration.
-  //   - The ambient resource set is frozen on first use (ordered by gatekeeper id) and folded
-  //     into the seed map, each named by its gatekeeper's suggested binding name.
+  //   - The ambient resource set is captured on first use (ordered by gatekeeper id) and folded
+  //     into the seed map, each named by its gatekeeper's suggested binding name. A regular chat
+  //     then takes in each ambient resource the workspace gains later, on its next turn.
   //   - Persisted messages that introduced resources but carry no binding name yet -- pasted
   //     resources, plus connection requests from before agents named their own -- are named
   //     (via the quick model when configured, else the gatekeeper's suggested name) and stamped,
@@ -7824,9 +7248,9 @@ class OverseerImpl implements AgentHooks {
     let dirty = false;
 
     if (context.alwaysAvailableCapsuleIds === undefined) {
-      // Freeze the ambient set + order on first use. Ordered by gatekeeper id (immutable) for
-      // determinism. New singletons the owner gains only appear in chats started afterwards; a
-      // since-disconnected one stays in the frozen list but becomes inert.
+      // Capture the ambient set + order on first use. Ordered by gatekeeper id (immutable) for
+      // determinism. A since-disconnected one stays in the list but becomes inert; ones the
+      // workspace gains later are appended below.
       context.alwaysAvailableCapsuleIds = [...this.storage.gatekeepers.list()]
           .filter(gk => gk.creationSpec?.type === "ambient")
           .map(gk => gk.id)
@@ -7843,8 +7267,7 @@ class OverseerImpl implements AgentHooks {
         // absence meaning "unrestricted" -- in which case it is resolved against the current
         // default binding list, mirroring how the storage migration rewrites stored spawner
         // records.
-        let env = context.spawnerConfig.env as
-            Record<string, WorkpieceId> | string[] | undefined;
+        let env = context.spawnerConfig.env;
         if (env === undefined || Array.isArray(env)) {
           for (let [name, target] of Object.entries(this.defaultBindingList())) {
             if (env === undefined || env.includes(name)) seed[name] = target;
@@ -7867,7 +7290,7 @@ class OverseerImpl implements AgentHooks {
       // (see getEnvForAgent). The name can still arrive from before it was reserved -- a legacy
       // gadget binding in the default list, or an old spawner's frozen env -- so such an entry is
       // renamed rather than dropped, keeping its target reachable. (A chat seeded before the
-      // reservation keeps its GIT binding: seeds are frozen.)
+      // reservation keeps its GIT binding: a seed entry is never renamed.)
       let isSeedNameTaken = (name: string) => name in seed || name === GIT_BINDING_NAME;
       if (GIT_BINDING_NAME in seed) {
         let target = seed[GIT_BINDING_NAME];
@@ -7881,16 +7304,8 @@ class OverseerImpl implements AgentHooks {
       for (let id of ambientIds) {
         if (seededTargets.has(id)) continue;
         let gk = this.storage.gatekeepers.get(id);
-        if (!gk) continue;  // disconnected since the freeze -- inert, no name needed
-        let suggested: string | undefined;
-        try {
-          suggested = (await this.getGatekeeperFacet(id).describe()).suggestedBindingName;
-        } catch (err) {
-          this.logger.warn("failed to fetch suggested binding name for ambient resource", {
-            event: "chat.binding.ambient.describe.failed", gatekeeperId: id, error: err,
-          });
-        }
-        seed[fallbackBindingName(suggested || "RESOURCE", isSeedNameTaken)] = id;
+        if (!gk) continue;  // disconnected since the chat took it in -- inert, no name needed
+        seed[await this.#ambientBindingName(id, isSeedNameTaken)] = id;
       }
 
       context.bindings = seed;
@@ -7951,6 +7366,11 @@ class OverseerImpl implements AgentHooks {
             if (call.output && !nameByTarget.has(call.output.worktreeId)) {
               nameByTarget.set(call.output.worktreeId, call.input.bindingName);
             }
+          } else if (call.toolName === "createExternalResource") {
+            taken.add(call.input.bindingName);
+            if (call.output && !nameByTarget.has(call.output.gatekeeperId)) {
+              nameByTarget.set(call.output.gatekeeperId, call.input.bindingName);
+            }
           }
         }
       } else if (msg.type === "connectionRequest") {
@@ -7980,6 +7400,31 @@ class OverseerImpl implements AgentHooks {
       }
     }
 
+    // A regular chat also takes in each ambient resource the workspace gained after the chat
+    // started (e.g. the owner turned on Web Search), deduped against every name in its scope. The
+    // system prompt keeps the list the chat started with; the agent learns of the new resource from
+    // a "catalogChange" message instead (see agent.ts). A spawned chat's env stays its spawner's
+    // (see #useScopeGatekeeperIds).
+    if (!context.spawnerConfig) {
+      let known = new Set(ambientIds);
+      let gained = [...this.storage.gatekeepers.list()]
+          .filter(gk => gk.creationSpec?.type === "ambient" && !known.has(gk.id))
+          .map(gk => gk.id)
+          .toSorted((a, b) => a - b);
+      for (let id of gained) {
+        if (nameByTarget.has(id)) continue;  // a legacy chat's new seed can already bind it
+        let name = await this.#ambientBindingName(id, n => taken.has(n));
+        seedMap[name] = id;
+        taken.add(name);
+        nameByTarget.set(id, name);
+      }
+      if (gained.length > 0) {
+        ambientIds = [...ambientIds, ...gained];
+        context.alwaysAvailableCapsuleIds = ambientIds;
+        dirty = true;
+      }
+    }
+
     if (anythingToName) {
       let quick = await this.#getNamingQuickModel();
 
@@ -7998,7 +7443,7 @@ class OverseerImpl implements AgentHooks {
           if (target !== undefined && this.storage.gatekeepers.get(target)) {
             try {
               suggested =
-                  (await this.getGatekeeperFacet(target).describe()).suggestedBindingName;
+                  (await (await this.getGatekeeperFacet(target)).describe()).suggestedBindingName;
             } catch {
               // Fall through to the generic fallback.
             }
@@ -8041,20 +7486,21 @@ class OverseerImpl implements AgentHooks {
     // scope-widening restart is omitted, like the other enumerating routes; one that answered null
     // before is not asked again (see #catalogless).
     //
-    // Deliberately not cached on the chat. A catalog says what the session can reach now, so a
-    // cached one can never show a skill added after the chat opened, and a cached failure reads as
-    // an empty library for the rest of the chat. Not an observation either: the catalog reaches
-    // every chat automatically, so by contract it holds nothing that needs observer verification.
+    // Loaded afresh every turn, since a catalog says what the session can reach now (see
+    // AiChatAgentContext.alwaysAvailableResources for how a change reaches the agent). Not an
+    // observation: the catalog reaches every chat automatically, so by contract it holds nothing
+    // that needs observer verification.
     let catalogs = new Map(await Promise.all(ambientIds
         .filter(id => this.gatekeeperUsable(id) && !this.#catalogless.has(id))
         .map(async (gatekeeperId): Promise<[number, AgentCatalog | null]> => {
           let record = this.storage.gatekeepers.get(gatekeeperId);
-          if (!record) return [gatekeeperId, null];  // disconnected since the chat froze its set.
+          if (!record) return [gatekeeperId, null];  // disconnected since the chat took it in.
           try {
             // getAgentCatalog is optional on Gatekeeper; ambient resources always implement it (the
             // agent relies on it for discovery), answering null when they have none, so we view the
             // facet through CatalogGatekeeperFacet (derived from the contract) to call it directly.
-            let facet = this.getGatekeeperFacet(gatekeeperId) as unknown as CatalogGatekeeperFacet;
+            let facet = await this.getGatekeeperFacet(gatekeeperId) as unknown as
+                CatalogGatekeeperFacet;
             let catalog = await facet.getAgentCatalog();
             if (!catalog) {
               this.#catalogless.add(gatekeeperId);
@@ -8076,14 +7522,6 @@ class OverseerImpl implements AgentHooks {
             return [gatekeeperId, null];
           }
         })));
-    if (dirty) {
-      // The work above is async, so the chat could have been deleted meanwhile. Don't resurrect
-      // its per-chat storage: deleteChat is the single cleanup point (see its comment) and
-      // removes chatMeta, so a missing chatMeta means the chat is gone.
-      if (this.storage.chatMeta.get(chatId)) {
-        this.storage.chatContext.put(context);
-      }
-    }
 
     // Materialize the seed entries, skipping targets that no longer exist (mirroring env build)
     // or that are blocked pending a scope-widening restart (like the enumerating routes above:
@@ -8105,19 +7543,34 @@ class OverseerImpl implements AgentHooks {
       if (ambientSet.has(target)) info.catalog = catalogs.get(target) ?? null;
       result.push(info);
     }
+
+    if (context.alwaysAvailableResources === undefined) {
+      context.alwaysAvailableResources = alwaysAvailableResources(result);
+      dirty = true;
+    }
+    if (dirty) {
+      // The work above is async, so the chat could have been deleted meanwhile. Don't resurrect
+      // its per-chat storage: deleteChat is the single cleanup point (see its comment) and
+      // removes chatMeta, so a missing chatMeta means the chat is gone.
+      if (this.storage.chatMeta.get(chatId)) {
+        this.storage.chatContext.put(context);
+      }
+    }
+
     return result;
   }
 
   async listSlashCommands(): Promise<SlashCommandChoice[]> {
     // A connection blocked pending a scope-widening restart is silently omitted (its commands
-    // reappear once the reset lands and clients reconnect) rather than failing the whole listing.
-    let sources = [...this.storage.gatekeepers.list()]
+    // reappear once the reset lands and clients reconnect) rather than failing the whole listing,
+    // as is one removed before its facet is reached.
+    let sources = (await Promise.all([...this.storage.gatekeepers.list()]
       .filter(record => record.hasSlashCommands && this.gatekeeperUsable(record.id))
-      .map(record => ({
+      .map(record => this.getGatekeeperFacet(record.id).then(gatekeeper => ({
         gatekeeperId: record.id,
         providerLabel: record.resourceTitle || `Gatekeeper ${record.id}`,
-        gatekeeper: this.getGatekeeperFacet(record.id),
-      }));
+        gatekeeper,
+      }), () => null)))).filter(source => source !== null);
     return [{
       selection: {builtin: true, commandId: "compact"},
       name: "compact",
@@ -8171,7 +7624,7 @@ class OverseerImpl implements AgentHooks {
       // description and no resource suggestion. Legacy records may carry an `included:
       // false` flag; honor it for backwards compatibility, but the current UI no longer
       // surfaces an exclusion control.
-      let annotation = edge.blueprintAnnotation as LegacyBlueprintBindingAnnotation | undefined;
+      let annotation = edge.blueprintAnnotation;
       if (annotation?.included === false) continue;
 
       let spec = gk.creationSpec;
@@ -8200,7 +7653,7 @@ class OverseerImpl implements AgentHooks {
           gatekeeperName: spec.vendorId,
           // Use the vendor's URL pattern, not the specific resource URL.
           // Fall back to resourceUrl for gatekeepers created before typeUrlPattern was stored.
-          typeUrlPattern: spec.typeUrlPattern || spec.resourceUrl,
+          typeUrlPattern: spec.typeUrlPattern || spec.resourceUrl!,
           ...(suggestValue ? {resourceUrl: spec.resourceUrl} : {}),
         };
       } else if (spec.type === "aiModel") {
@@ -8210,6 +7663,8 @@ class OverseerImpl implements AgentHooks {
           ...(suggestValue
             ? {suggestedModel: {provider: spec.provider, modelName: spec.modelName}}
             : {}),
+          ...(modelKind(spec.provider, spec.modelName) === "decision"
+              ? {modelKind: "decision"} : {}),
         };
       } else if (spec.type === "agentSpawner") {
         spawnerEdges.push({bindingName, spec, base, suggestValue});
@@ -8261,9 +7716,14 @@ class OverseerImpl implements AgentHooks {
                   ...synthBase,
                   type: "gatekeeper",
                   gatekeeperName: targetSpec.vendorId,
-                  typeUrlPattern: targetSpec.typeUrlPattern || targetSpec.resourceUrl,
+                  typeUrlPattern: targetSpec.typeUrlPattern || targetSpec.resourceUrl!,
                 }
-              : {...synthBase, type: "aiModel"};
+              : {
+                  ...synthBase,
+                  type: "aiModel",
+                  ...(modelKind(targetSpec.provider, targetSpec.modelName) === "decision"
+                      ? {modelKind: "decision"} : {}),
+                };
           // Register the synthesized binding so any later env entry (in this or another spawner)
           // targeting the same workpiece references it instead of synthesizing a duplicate.
           edgeNameByTarget.set(target, synthName);
@@ -8305,52 +7765,159 @@ class OverseerImpl implements AgentHooks {
     throw new Error("This gadget has no code to publish. Accept some code first.");
   }
 
-  // Create a minimal Yjs doc snapshot (no edit history) of the given commit's files, for a
-  // blueprint archive. Returns a gzip-compressed Yjs V2 encoded state update. The snapshot
-  // always uses the unnamed root "" (the canonical archive root), regardless of which root holds
-  // the gadget's files in chat docs, so archives stay compatible across gadgets. (Blueprints of
-  // code-less gadgets cannot be created, so a commit is always in hand.)
-  async snapshotCode(commitId: string): Promise<Uint8Array> {
-    let files = await this.gitStore.readCommitFiles(commitId);
+  // Mints the blueprint's next release (see blueprint-release.ts) from the tree of the gadget
+  // commit `sourceCommit`: writes the release commit, records it on `record` -- which the caller
+  // stores by propagating it -- and returns the pack to propagate with it. If that tree is what
+  // the blueprint's latest release already holds, and the gadget has merged no other blueprint
+  // since, there is nothing to release: the record is left alone and undefined is returned.
+  //
+  // The release's first parent is the release before it. For a record last published before
+  // releases were commits, that is the snapshot release of the files it published, which is the
+  // release everyone who reads that content derives from it. Such a record's first release here
+  // is minted even over an unchanged tree, since it is what moves the stored content to a pack.
+  //
+  // Its other parents are the releases of other blueprints that the gadget has merged since, so
+  // that whoever holds this release can find what it has in common with theirs. A first parent
+  // always belongs to the blueprint's own lineage, so a blueprint with no release yet to come
+  // before those gets an empty one: release 0, the root of its lineage.
+  async mintBlueprintRelease(record: BlueprintGadgetRecord, sourceCommit: string)
+      : Promise<Uint8Array | undefined> {
+    let tree = await this.gitStore.commitTree(sourceCommit);
+    let previous = record.releases?.at(-1)?.releaseCommit;
+    let unchanged = previous !== undefined && await this.gitStore.commitTree(previous) === tree;
+    if (previous === undefined && record.commitId !== undefined) {
+      let snapshot = await buildSnapshotRelease(
+          await this.gitStore.readCommitFiles(record.commitId));
+      await this.gitCache.importObjects(snapshot.objects.values());
+      previous = snapshot.commitId;
+    }
+    let merged = await this.releasesMergedSince(sourceCommit, record.commitId, previous);
+    if (unchanged && merged.length === 0) return undefined;
 
-    // Create a clean doc with only final content (one insert per file, no history).
-    let cleanDoc = new Y.Doc();
-    let cleanMap = cleanDoc.getMap<Y.Text>();
-    for (let [file, content] of files) {
-      let text = cleanMap.set(file, new Y.Text());
-      text.insert(0, content);
+    let publication = {
+      author: commitIdentityForAuthor(record.metadata.author),
+      title: record.metadata.title,
+      timestamp: new Date(),
+    };
+    let mint = async (release: Pick<Release, "tree" | "parents" | "version">) => {
+      let payload = encodeReleaseCommit({ ...release, ...publication });
+      await this.gitCache.importObjects([{ type: "commit", payload }]);
+      return await gitObjectOid("commit", payload);
+    };
+
+    if (previous === undefined && merged.length > 0) {
+      let emptyTree = await gitObjectOid("tree", encodeGitTree([]));
+      previous = await mint({ tree: emptyTree, parents: [], version: 0 });
+    }
+    let version = record.metadata.version + 1;
+    let parents = previous === undefined ? [] : [previous, ...merged];
+    let releaseCommit = await mint({ tree, parents, version });
+
+    record.releases = [...record.releases ?? [], { version, releaseCommit, sourceCommit }];
+    record.commitId = sourceCommit;
+    delete record.codeVersion;
+    record.metadata.version = version;
+    record.metadata.commitId = releaseCommit;
+    return await this.buildBlueprintPack(releaseCommit);
+  }
+
+  // The blueprint releases merged into a gadget on the way from its commit `since` to its
+  // commit `head`, or in the whole of `head`'s history if `since` is undefined, in the order
+  // they were merged. Those that `previous` (a release, if given) or another of them already
+  // has in its history are left out, as naming them again would say nothing.
+  //
+  // A commit merged a release only if it marks it as one (see releasesMergedBy). Its other
+  // parents are the gadget's own history: its first parent, and any other commit of the
+  // gadget's that it merged, such as a chat's own files. The walk follows all of those, since a
+  // mark can lie off the first-parent chain -- a blueprint proposal's merge, reached through the
+  // files of the chat that held it when the chat was brought up to date. It never enters a
+  // release's history, which holds no commit of the gadget's own, and stops at the history of
+  // `since`. A commit's releases come after those of its first parent's history and then of its
+  // other parents', which makes the order oldest first.
+  async releasesMergedSince(head: string, since: string | undefined, previous: string | undefined)
+      : Promise<string[]> {
+    let read = (oid: string) => {
+      let object = this.gitCache.readLocalObject(oid);
+      if (object?.type !== "commit") throw new Error(`Commit ${oid} is not in the git store.`);
+      let releases = releasesMergedBy(object.payload, oid);
+      let own = parseGitCommitRefs(object.payload, oid).parents
+          .filter(parent => !releases.includes(parent));
+      return {releases, own};
+    };
+
+    // `since` and everything in its own history, which the walk below is not to enter.
+    let reached = new Set<string>();
+    for (let pending = since === undefined ? [] : [since]; pending.length > 0;) {
+      let oid = pending.pop()!;
+      if (reached.has(oid)) continue;
+      reached.add(oid);
+      pending.push(...read(oid).own);
     }
 
-    let encoded = Y.encodeStateAsUpdateV2(cleanDoc);
+    // Depth first, finishing a commit only once its own parents are finished.
+    let merged: string[] = [];
+    let stack: {oid: string, commit?: ReturnType<typeof read>}[] = [{oid: head}];
+    while (stack.length > 0) {
+      let top = stack.at(-1)!;
+      if (top.commit !== undefined) {
+        stack.pop();
+        merged.push(...top.commit.releases);
+      } else if (reached.has(top.oid)) {
+        stack.pop();
+      } else {
+        reached.add(top.oid);
+        top.commit = read(top.oid);
+        // Reversed, so that the first parent is the first to be taken off the stack.
+        stack.push(...top.commit.own.toReversed().map(oid => ({oid})));
+      }
+    }
+    return merged.filter((release, index) =>
+        merged.indexOf(release) === index &&
+        !(previous !== undefined && this.gitCache.isAncestor(release, previous)) &&
+        !merged.some(other => other !== release && this.gitCache.isAncestor(release, other)));
+  }
 
-    // Compress with gzip via CompressionStream.
-    let cs = new CompressionStream("gzip");
-    let writer = cs.writable.getWriter();
-    writer.write(encoded);
-    writer.close();
-    return new Uint8Array(await new Response(cs.readable).arrayBuffer());
+  // Builds the pack of a release this workspace minted. A release always yields the same bytes.
+  async buildBlueprintPack(releaseCommit: string): Promise<Uint8Array> {
+    return await buildReleasePack(oid => this.gitCache.readLocalObject(oid), releaseCommit);
+  }
+
+  // Loads the release that `metadata` describes into the workspace's git store, returning its
+  // release commit. Throws if its content is missing or invalid, having stored none of it. The
+  // metadata is the caller's to read (see readBlueprintRelease()).
+  //
+  // This is the one way a blueprint's objects enter the workspace, so what
+  // readBlueprintRelease() admits is all that one can add to the store.
+  async loadBlueprint(blueprintId: string, metadata: BlueprintMetadata): Promise<string> {
+    let release = await readBlueprintRelease(this.env, blueprintId, metadata);
+    await this.gitCache.importObjects(release.objects.values());
+    return release.commitId;
   }
 
   // Propagate a blueprint to User DO, KV, and R2.
-  // If codeSnapshot is provided, it is uploaded to R2. If omitted (metadata-only update),
-  // the R2 content is left unchanged.
+  // If `pack` is provided, it is the pack of the record's latest release, and is uploaded to R2.
+  // If omitted (metadata-only update), the R2 content is left unchanged -- unless the record is
+  // still dirty from an earlier attempt, which may not have got as far as uploading its latest
+  // release. That release is then uploaded again.
   async propagateBlueprint(
       record: BlueprintGadgetRecord,
-      codeSnapshot?: Uint8Array,
+      pack?: Uint8Array,
       screenshot?: BlueprintScreenshotUpload | null,
   ): Promise<void> {
     if (!this.ownerId) throw new Error("Workspace not initialized.");
+
+    let release = record.releases?.at(-1);
+    if (!pack && record.dirty && release) {
+      pack = await this.buildBlueprintPack(release.releaseCommit);
+    }
 
     // Mark dirty.
     record.dirty = true;
     this.storage.blueprints.put(record);
 
-    // Upload code snapshot to R2 (only when code is being created/updated).
-    if (codeSnapshot) {
-      await this.env.BLUEPRINT_CONTENT.put(
-        `${record.id}/${record.metadata.version}`,
-        codeSnapshot
-      );
+    // Upload the release to R2 (only when code is being created/updated).
+    if (pack) {
+      await this.env.BLUEPRINT_CONTENT.put(blueprintContentKey(record.id, record.metadata), pack);
     }
 
     if (screenshot !== undefined) {
@@ -8401,9 +7968,7 @@ class OverseerImpl implements AgentHooks {
     await this.env.BLUEPRINTS.delete(record.id);
 
     // Delete all historical versions from R2.
-    for (let v = 1; v <= record.metadata.version; v++) {
-      await this.env.BLUEPRINT_CONTENT.delete(`${record.id}/${v}`);
-    }
+    await deleteBlueprintContent(this.env, record.id);
     await this.env.BLUEPRINT_CONTENT.delete(`${BLUEPRINT_SCREENSHOT_R2_PREFIX}${record.id}`);
 
     // Delete from User DO.
@@ -8508,7 +8073,7 @@ class OverseerImpl implements AgentHooks {
     try {
       let parts: string[] = [];
 
-      for (let msg of this.storage.chats.list({prefix: `${keyString(chatId)}.`})) {
+      for (let msg of this.storage.chats.list({prefix: chatKeyPrefix(chatId)})) {
         if (msg.type === "message") {
           parts.push(`[${msg.author.type}]: ${msg.message}`);
         }
@@ -8657,8 +8222,7 @@ class OverseerImpl implements AgentHooks {
   }
 
   getChatModelData(chatId: number, sequence: number): StoredAssistantMessage | undefined {
-    return this.storage.chatModelData.get(
-        `${keyString(chatId)}.${keyString(sequence)}`)?.message;
+    return this.storage.chatModelData.get(chatKey(chatId, sequence))?.message;
   }
 
   // Adds an inference cost (in dollars) to a chat's running total and the workspace-wide total.
@@ -8849,12 +8413,31 @@ class OverseerImpl implements AgentHooks {
     return result;
   }
 
+  // Whether the chat's current turn waits on the user's decision on a connection or action. Scans
+  // back to whatever started the turn, as #maybeResumeAfterActionDecision does.
+  #awaitsDecision(chatId: number): boolean {
+    for (let msg of this.storage.chats.list({prefix: chatKeyPrefix(chatId), reverse: true})) {
+      if (msg.type === "agentCallback") return false;
+      if (msg.type === "message" && (msg.author.type === "user" || msg.author.type === "gadget")) {
+        return false;
+      }
+      if (msg.type === "connectionRequest" && msg.state === "pending") return true;
+      if (msg.type === "action") {
+        let record = this.storage.actions.get(msg.actionId);
+        if (record?.type === "action" && record.caller.from === "agent" &&
+            record.description.awaitDecision && record.state === "pending") {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
   // --- Connection-request hooks ---
 
   #ownerUserStub() {
     if (!this.ownerId) throw new Error("Workspace has been deleted.");
-    return wrapDoStubForTelemetry(
-        this.users.get(this.users.idFromString(this.ownerId)), this.logger);
+    return this.wrapUserDo(this.users.get(this.users.idFromString(this.ownerId)));
   }
 
   // Short-TTL cache for the gatekeeper vendor list. The list is derived from static
@@ -8893,6 +8476,15 @@ class OverseerImpl implements AgentHooks {
     }
   }
 
+  getPromptCacheSalt(): string {
+    let salt = this.storage.promptCacheSalt.get();
+    if (salt === undefined) {
+      salt = crypto.randomUUID();
+      this.storage.promptCacheSalt.put(salt);
+    }
+    return salt;
+  }
+
   async listConnectableVendors(): Promise<{id: string, displayName: string}[]> {
     try {
       let vendors = await this.#listGatekeeperVendorsCached();
@@ -8918,7 +8510,8 @@ class OverseerImpl implements AgentHooks {
     }
     let lines = [`Resource types offered by "${vendorId}" (${vendor.description.displayName}):`];
     for (let r of vendor.supportedResources) {
-      lines.push(`* ${r.title} — urlPattern: ${r.urlPattern}\n  ${r.description}`);
+      lines.push(`* ${r.title} — urlPattern: ${r.urlPattern}` +
+          `${r.creatable ? " (creatable with createExternalResource)" : ""}\n  ${r.description}`);
     }
     lines.push(
         `\nTo request one, call requestConnection with vendorId="${vendorId}" and a resourceUrl ` +
@@ -8992,6 +8585,36 @@ class OverseerImpl implements AgentHooks {
     let result = this.#capturedConnectionRequests.get(chatId) ?? [];
     this.#capturedConnectionRequests.delete(chatId);
     return result;
+  }
+
+  // Mint a gatekeeper simulating a new resource, tied to no account, and queue its creation.
+  // Unlike addGatekeeper(), this publishes without restarting collaborator sessions: a restart now
+  // would abort this turn before its tool call is recorded, and until the creation applies there
+  // is no real resource to verify anyone against -- the simulated one holds only what was written
+  // through this workspace, which no current collaborator is excluded from
+  // (#enforceExcludeObservers). applyPendingAction restarts once the resource is real.
+  async createExternalResource(
+      chatId: number, input: Extract<AiToolCall, {toolName: "createExternalResource"}>["input"])
+      : Promise<{gatekeeperId: WorkpieceId}> {
+    let minted = await this.#ownerUserStub().createResourceGatekeeper(
+        input.vendorId, input.resourceUrlPattern, input.title);
+    let id = this.allocateWorkpieceId();
+    this.storage.gatekeepers.put({
+      id,
+      class: minted.class,
+      resourceTitle: input.title,
+      creationSpec: {type: "gatekeeper", vendorId: input.vendorId,
+                     typeUrlPattern: minted.typeUrlPattern},
+    });
+    await this.submitAction(id, "create", minted.action, {from: "agent", chatId})
+        .catch(error => { this.removeGatekeeper(id); throw error; });
+    return {gatekeeperId: id};
+  }
+
+  // Whether the gatekeeper's resource is still simulated: its creation is pending.
+  #creationPending(id: WorkpieceId): boolean {
+    return [...this.storage.actions.pendingByGatekeeper.get(id)]
+        .some(queued => queued.type === "action" && queued.action === "create");
   }
 
   // --- Blueprint hooks for the agent ---
@@ -9103,28 +8726,25 @@ class OverseerImpl implements AgentHooks {
 
   // Fetch a blueprint's decoded files, plus formatted notes describing what was copied and which
   // bindings the blueprint's code expects the agent to wire up, for instantiation as a new gadget
-  // by the agent's createGadget tool. Blueprint ids are bearer capabilities (like blueprint share
-  // links), so possession of the id is sufficient to read it. Throws agent-readable errors.
-  async fetchBlueprint(blueprintId: string)
-      : Promise<{files: Record<string, string>, notes: string, output?: BlueprintOutput}> {
+  // by the agent's createGadget tool, and the record of that for the creation's "changes"
+  // message (see AiChatMessageBody.blueprintMerges). Blueprint ids are bearer capabilities (like
+  // blueprint share links), so possession of the id is sufficient to read it. Throws
+  // agent-readable errors.
+  async fetchBlueprint(blueprintId: string): Promise<{
+    files: Record<string, string>, notes: string, output?: BlueprintOutput,
+    merge: Omit<BlueprintMerge, "gadgetId">,
+  }> {
     let kvRecord = await readBlueprintKvRecord(this.env, blueprintId);
     if (!kvRecord) {
       throw new Error(`No such blueprint: ${blueprintId}. Use listBlueprints to see available ` +
           `blueprints.`);
     }
-    let code = await readBlueprintContent(this.env, blueprintId, kvRecord.metadata.version);
-    if (!code) {
-      throw new Error(`The content of blueprint ${blueprintId} is missing; it cannot be ` +
-          `instantiated.`);
-    }
+    let commitId = await this.loadBlueprint(blueprintId, kvRecord.metadata);
 
-    // Decode the snapshot. Archives always use the doc's unnamed root "" (see snapshotCode).
-    let archiveDoc = new Y.Doc();
-    Y.applyUpdateV2(archiveDoc, code);
     // Null prototype so a hostile filename like "__proto__" is an ordinary key.
     let files: Record<string, string> = Object.create(null);
-    for (let [file, content] of archiveDoc.getMap<Y.Text>()) {
-      files[file] = content.toString();
+    for (let [file, content] of await this.gitStore.readCommitFiles(commitId)) {
+      files[file] = content;
     }
 
     // Apply the deployment's overrides, so a gadget the agent builds is labelled the same as one
@@ -9145,44 +8765,20 @@ class OverseerImpl implements AgentHooks {
           `them before editing.`
         : `The blueprint contained no files, so the new gadget is empty.`);
 
-    let bindings = Object.entries(kvRecord.metadata.bindings);
-    if (bindings.length === 0) {
-      lines.push("", `The blueprint requires no bindings.`);
-    } else {
-      lines.push("",
-          `The blueprint's code expects the following bindings, which the new gadget does not ` +
-          `have yet. Wire up each one under the exact binding name given. For external ` +
-          `resources, use setGadgetBinding on the new gadget (first requesting a connection via ` +
-          `requestConnection if your env doesn't already hold a suitable resource). AI-model ` +
-          `and agent-spawner bindings cannot be created from chat; ask the user to add those ` +
-          `from the gadget's Connections panel.`);
-      for (let [name, binding] of bindings) {
-        let details: string;
-        switch (binding.type) {
-          case "gatekeeper":
-            details = `external resource via the "${binding.gatekeeperName}" gatekeeper; ` +
-                `resource URL pattern ${JSON.stringify(binding.typeUrlPattern)}` +
-                (binding.resourceUrl
-                    ? `; the blueprint author suggests ${JSON.stringify(binding.resourceUrl)}`
-                    : ``);
-            break;
-          case "aiModel":
-            details = `an AI model binding`;
-            break;
-          case "agentSpawner":
-            details = `an agent-spawner binding`;
-            break;
-          default:
-            binding satisfies never;
-            details = `unknown`;
-            break;
-        }
-        lines.push(`* ${name} — ${JSON.stringify(binding.title)} (${details})` +
-            (binding.description ? `: ${binding.description}` : ``));
-      }
-    }
+    let {bindings} = kvRecord.metadata;
+    lines.push("", Object.keys(bindings).length === 0
+        ? `The blueprint requires no bindings.`
+        : formatMissingBlueprintBindings(bindings, `the new gadget`));
 
-    return {files, notes: lines.join("\n"), output};
+    // What the creation is recorded as. The new gadget's files are the release's exactly, with
+    // nothing to merge them against.
+    let merge: Omit<BlueprintMerge, "gadgetId"> = {
+      blueprintId, title: kvRecord.metadata.title, version: kvRecord.metadata.version, commitId,
+      kind: "fastForward", conflictPaths: [],
+      ...this.#missingBlueprintBindings(kvRecord.metadata),
+    };
+
+    return {files, notes: lines.join("\n"), output, merge};
   }
 
   #tailSubscribers: Set<RpcStub<ConsoleLogSubscriber>> = new Set();
@@ -9340,7 +8936,10 @@ class OverseerImpl implements AgentHooks {
       if (!observerVendorId(gk)) continue;
       result.push(gk);
     }
-    return result;
+    // A simulated resource has no account behind it to verify anyone against. Approving its
+    // creation restarts every session (see applyPendingAction), so verification happens then.
+    // (Filtered after the listing: reading another index mid-listing would end it.)
+    return result.filter(gk => !this.#creationPending(gk.id));
   }
 
   listObserverRequirements(role: CollaboratorRole): ObserverBindingNeed[] {
@@ -9384,8 +8983,8 @@ class OverseerImpl implements AgentHooks {
   async #removeObserverFromGatekeepers(observerId: string, gatekeeperIds: number[]): Promise<void> {
     await Promise.all(gatekeeperIds.map(async id => {
       try {
-        await this.#withObserverGatekeeperLock(
-            observerId, id, () => this.getGatekeeperFacet(id).removeObserver(observerId));
+        await this.#withObserverGatekeeperLock(observerId, id,
+            async () => (await this.getGatekeeperFacet(id)).removeObserver(observerId));
       } catch (err) {
         this.logger.warn("failed to remove observer from gatekeeper", {
           event: "gatekeeper.observer.remove.failed", gatekeeperId: id, observerId, error: err,
@@ -9620,7 +9219,7 @@ class OverseerImpl implements AgentHooks {
             // exclusion teardown's removeObserver for the same pair is still in flight (which
             // would delete it moments later); see #withObserverGatekeeperLock.
             await this.#withObserverGatekeeperLock(observerId, gk.id,
-                () => this.getGatekeeperFacet(gk.id).addObserver(observerId, verifier));
+                async () => (await this.getGatekeeperFacet(gk.id)).addObserver(observerId, verifier));
             newlyAdded.add(gk.id);
             // Keep `invalidated` meaning "failed and has not verified since": this binding just
             // verified on a repaired pass, so the catch below must not roll its registration back.
@@ -9813,25 +9412,38 @@ class OverseerImpl implements AgentHooks {
     return targets?.size === 1 ? targets.values().next().value : undefined;
   }
 
-  restore(params: OverseerRestoreParams): Fetcher<DurableObject> | Fetcher<RestoreForgerEntrypoint> {
-    if (params.type !== "gadget") {
-      throw new TypeError("Unknown restore params type: " + params.type);
-    }
+  restore(params: OverseerRestoreParams)
+      : Fetcher<DurableObject> | Fetcher<RestoreForgerEntrypoint> | Fetcher<Gatekeeper<any>> {
+    switch (params.type) {
+      case "gadget": {
+        if (params.codeId) {
+          // The forger worker being loaded through ctx.restore() by forgeRestoreStubForBinding().
+          let code = this.#codeIdMap.get(params.codeId);
+          if (code) {
+            return this.env.LOADER.load(code).getEntrypoint<RestoreForgerEntrypoint>();
+          }
+        }
 
-    if (params.codeId) {
-      // The forger worker being loaded through ctx.restore() by forgeRestoreStubForBinding().
-      let code = this.#codeIdMap.get(params.codeId);
-      if (code) {
-        return this.env.LOADER.load(code).getEntrypoint<RestoreForgerEntrypoint>();
+        // Old params (persisted before multi-gadget support, sealed inside hook callbacks) have
+        // no gadgetId; they resolve to the default gadget. If that gadget was deleted (or there
+        // is no default), this fails with an explicit error rather than silently retargeting.
+        let gadgetId = this.resolveGadgetId(params.gadgetId);
+        this.getGadgetRecord(gadgetId);  // validate it exists
+        return this.#getGadgetFacetRaw(
+            gadgetId, this.#resolveGadgetChatId(gadgetId, params.chatId));
       }
-    }
 
-    // Old params (persisted before multi-gadget support, sealed inside hook callbacks) have no
-    // gadgetId; they resolve to the default gadget. If that gadget was deleted (or there is no
-    // default), this fails with an explicit error rather than silently retargeting.
-    let gadgetId = this.resolveGadgetId(params.gadgetId);
-    this.getGadgetRecord(gadgetId);  // validate it exists
-    return this.#getGadgetFacetRaw(gadgetId, this.#resolveGadgetChatId(gadgetId, params.chatId));
+      case "gatekeeper":
+        // Existence only: whether the connection may be used is still decided where it is used
+        // (assertGatekeeperUsable, startHook).
+        if (!this.storage.gatekeepers.get(params.gatekeeperId)) {
+          throw new Error("This connection has been removed from the workspace.");
+        }
+        return this.#getGatekeeperFacetRaw(params.gatekeeperId);
+
+      default:
+        throw new TypeError("Unknown restore params: " + JSON.stringify(params));
+    }
   }
 }
 
@@ -9864,6 +9476,12 @@ type OverseerRestoreParams = {
   // stub is persisted with these params as its self-token -- which, `codeId` no longer matching,
   // now restores through the gadget's [restore]() method.
   codeId?: string;
+} | {
+  // A stub pointing at a gatekeeper (connection) facet, minted by getGatekeeperFacet(). Like a
+  // gadget's, the gatekeeper's own ctx.restore() chains off it, so the persistent stubs it mints
+  // to itself stop restoring once the connection is removed.
+  type: "gatekeeper";
+  gatekeeperId: WorkpieceId;
 };
 
 export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
@@ -9900,7 +9518,7 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
 
     // A workspace initialized by this version of the code is born at the current schema version;
     // there is nothing to migrate.
-    this.impl.storage.version.put(4);
+    this.impl.storage.version.put(OVERSEER_STORAGE_VERSION);
   }
 
   /**
@@ -10167,7 +9785,7 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
     let modelId = null;
     if (externalChat) {
       // Continue existing chats with the most recent agent model used in that chat.
-      for (let msg of this.impl.storage.chats.list({ prefix: `${keyString(externalChat.chatId)}.`, reverse: true })) {
+      for (let msg of this.impl.storage.chats.list({ prefix: chatKeyPrefix(externalChat.chatId), reverse: true })) {
         if (msg.author.type === "agent") {
           modelId = msg.author.id;
           break;
@@ -10224,30 +9842,27 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
   }
 
   /**
-   * Initialize this workspace's default gadget from a blueprint's code snapshot. Called by
-   * AuthenticatedApi.newGadgetFromBlueprint() after creating (and opening) the DO.
+   * Initialize this workspace's default gadget from the release of a blueprint that `metadata`
+   * describes. Called by AuthenticatedApi.newGadgetFromBlueprint() after creating (and opening)
+   * the DO, with the metadata it goes on to set up the gadget's bindings from: the blueprint may
+   * be republished meanwhile, and the code has to be the version those bindings belong to.
    */
-  async initializeFromBlueprint(code: Uint8Array, title: string, output?: BlueprintOutput)
-      : Promise<void> {
+  async initializeFromBlueprint(
+      blueprintId: string, metadata: BlueprintMetadata, output?: BlueprintOutput): Promise<void> {
     // Set the title. The default gadget (created below) inherits it.
+    let { title } = metadata;
     this.impl.storage.title.put(title);
 
-    // Decode the archive and write the gadget's initial (parentless) commit *before* creating
-    // the gadget record: every permanent gadget is born with a head (see GadgetRecord.commitId),
-    // so a failure here -- an empty archive, an unreachable owner -- must not leave a headless
-    // record behind. The commit is content-addressed and referenced by nothing until the record
-    // lands, so writing it first is safe. Archives always use the doc's unnamed root "" (see
-    // snapshotCode); the file contents transfer as plain text, becoming the gadget's first
-    // committed tree. An empty archive is refused rather than instantiated as a code-less
-    // gadget: blueprints of such gadgets cannot be created (see createBlueprint), so one can
-    // only arrive corrupted or hand-crafted.
-    let archiveDoc = new Y.Doc();
-    Y.applyUpdateV2(archiveDoc, code);
-    let files = new Map<string, string>();
-    for (let [file, content] of archiveDoc.getMap<Y.Text>()) {
-      files.set(file, content.toString());
-    }
-    if (files.size === 0) {
+    // Load the release and write the gadget's initial commits *before* creating the gadget
+    // record: every permanent gadget is born with a head (see GadgetRecord.commitId), so a
+    // failure here -- invalid content, an empty release, an unreachable owner -- must not leave
+    // a headless record behind. The commits are content-addressed and referenced by nothing
+    // until the record lands, so writing them first is safe. The release's tree becomes the
+    // gadget's first committed tree. An empty release is refused rather than instantiated as a
+    // code-less gadget: blueprints of such gadgets cannot be created (see createBlueprint), so
+    // one can only arrive corrupted or hand-crafted.
+    let release = await this.impl.loadBlueprint(blueprintId, metadata);
+    if ((await this.impl.gitStore.readCommitFiles(release)).size === 0) {
       throw new Error("This blueprint's code archive is empty.");
     }
     let ownerId = this.impl.ownerId;
@@ -10256,14 +9871,29 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
     }
     // Fresh stub per call, so the pure whoami() read below is safe to retry once across a
     // user-DO reset (see retryOnDoReset: a captured stub would be permanently broken).
-    let owner = () => wrapDoStubForTelemetry(
-        this.impl.users.get(this.impl.users.idFromString(ownerId)), this.impl.logger);
+    let owner = () => this.impl.wrapUserDo(
+        this.impl.users.get(this.impl.users.idFromString(ownerId)));
     let ownerProfile = await retryOnDoReset(() => owner().whoami(), this.impl.logger);
-    let commitId = await this.impl.gitStore.writeFilesAsCommit(files, {
+
+    // The gadget's history starts at an empty root of its own, into which its head merges the
+    // release: the head's tree is the release's, its first parent the root, its second the
+    // release, which it marks as a release it merged (see releasesMergedSince). A commit's first
+    // parent is always the gadget's own previous state, so the gadget's first-parent chain is its
+    // own history, every commit of which has its tree here. The release's ancestors, most of
+    // which arrived without theirs, are only ever reached through other parents -- where a later
+    // update finds what the gadget and a blueprint have in common.
+    let authorship = { author: commitIdentityForAuthor(ownerProfile), timestamp: new Date() };
+    let root = await this.impl.gitStore.writeFilesAsCommit(new Map(), {
+      ...authorship,
       parents: [],
-      author: commitIdentityForAuthor(ownerProfile),
+      message: `Create gadget: ${title}`,
+    });
+    let commitId = await this.impl.gitStore.writeCommitForTree(
+        await this.impl.gitStore.commitTree(release), {
+      ...authorship,
+      parents: [root, release],
       message: `Instantiate blueprint: ${title}`,
-      timestamp: new Date(),
+      headers: [releaseMergeHeader(release)],
     });
 
     // Blueprint instantiation still creates a fresh workspace containing one auto-created gadget,
@@ -10276,13 +9906,15 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
       source: "blueprint",
     });
 
-    // The gadget inherits the blueprint's declared format, so it is named and drawn as a Document
-    // (or whatever it produces) rather than a generic app.
+    // The gadget follows the blueprint, from the release it was built from. It also inherits the
+    // blueprint's declared format, so it is named and drawn as a Document (or whatever it
+    // produces) rather than a generic app.
+    let record = this.impl.getGadgetRecord(gadgetId);
+    record.upstream = { blueprintId, commitId: release };
     if (output) {
-      let record = this.impl.getGadgetRecord(this.impl.resolveGadgetId(undefined));
       record.output = output;
-      this.impl.storage.gadgets.put(record);
     }
+    this.impl.storage.gadgets.put(record);
 
     // Mark gadget as non-provisional (it has code, so it should appear in the gadget list).
     // (A write, so deliberately not retried -- a reset can't distinguish "never applied" from
@@ -10453,24 +10085,6 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
     return this.impl.restore(params);
   }
 }
-
-type GatekeeperCaller = {
-  from: "agent";
-  chatId: number;
-} | {
-  from: "gadget";
-  chatId?: number;
-
-  // Which gadget made the call. Optional for backward compatibility: callers embedded in
-  // ActionRecords persisted before multi-gadget support have no gadgetId. `defaultGadgetId`
-  // should be assumed when `gadgetId` is absent.
-  gadgetId?: WorkpieceId;
-} | {
-  from: "user";
-  chatId?: number;
-} | {
-  from: "hook";
-};
 
 type GatekeeperLoopbackProps = {
   overseerId: string;
@@ -10777,15 +10391,13 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
   // stub has become broken (see AuthenticatedApiImpl.#user in server.ts).
   get #owner(): DurableObjectStub<UserDurableObject> {
     if (!this.impl.ownerId) throw new Error("Workspace has been deleted.");
-    return wrapDoStubForTelemetry(
-        this.impl.users.get(this.impl.users.idFromString(this.impl.ownerId)),
-        this.impl.logger);
+    return this.impl.wrapUserDo(
+        this.impl.users.get(this.impl.users.idFromString(this.impl.ownerId)));
   }
 
   get #clientUser(): DurableObjectStub<UserDurableObject> {
-    return wrapDoStubForTelemetry(
-        this.impl.users.get(this.impl.users.idFromString(this.clientUserId)),
-        this.impl.logger);
+    return this.impl.wrapUserDo(
+        this.impl.users.get(this.impl.users.idFromString(this.clientUserId)));
   }
 
   #leaveSession: () => void;
@@ -10943,17 +10555,13 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
     await this.#owner.updateTitle(this.impl.ctx.id.toString(), title);
   }
 
-  async setPinned(pinned: boolean): Promise<void> {
-    await this.#clientUser.updatePinned(this.impl.ctx.id.toString(), pinned);
-  }
-
   async subscribeToWorkpieces(subscriber: RpcStub<WorkpiecesSubscriber>): Promise<RpcStub<{}>> {
     return this.#subscriptionLease(this.impl.subscribeToWorkpieces(subscriber, true));
   }
 
   async createGadget(title: string, chatId?: number, bindingName?: string)
       : Promise<RpcStub<GadgetClient>> {
-    // When creating within a chat, names already claimed in that chat's scope (its frozen seed
+    // When creating within a chat, names already claimed in that chat's scope (its seed
     // plus log-derived bindings) are off-limits too: the chat's binding map is keyed by name,
     // so on replay the existing binding would win and the new gadget would never be addressable
     // under its promised name.
@@ -11098,6 +10706,10 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
     return await this.impl.gitCache.readFilesAtCommit(validateOid(commitId), paths);
   }
 
+  async listChangedPaths(fromCommit: string, toCommit: string): Promise<string[]> {
+    return await this.impl.listChangedPaths(validateOid(fromCommit), validateOid(toCommit));
+  }
+
   async getCommitLog(fromCommit: string, depth?: number): Promise<CommitInfo[]> {
     if (depth !== undefined && (!Number.isInteger(depth) || depth <= 0)) {
       throw new Error("Invalid depth.");
@@ -11118,9 +10730,10 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
     }
     // A connection published moments before a scope-widening restart is not usable by the
     // sessions that restart is about to sever (see #gatekeepersPendingRestart).
+    let facet = await this.impl.getGatekeeperFacet(id);
     this.impl.assertGatekeeperUsable(id);
-    return new GatekeeperClientImpl(this.impl, id, this.impl.getGatekeeperFacet(id),
-        this.clientUserId, this.#mintedCapabilityKind());
+    return new GatekeeperClientImpl(
+        this.impl, id, facet, this.clientUserId, this.#mintedCapabilityKind());
   }
 
   private async recordConnectionCreated(
@@ -11155,7 +10768,7 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
   async newAiModelGatekeeper(modelId: string): Promise<GatekeeperClient<any>> {
     let chatMeta = await retryOnDoReset(
         () => this.#clientUser.getChatContext(modelId), this.impl.logger);
-    let props: LanguageModelGatekeeperProps = {
+    let props: AiModelGatekeeperProps = {
       displayName: chatMeta.aiModel!.profile.name,
       config: chatMeta.aiModel!.config,
       initiator: this.impl.gadgetAuthorFor(chatMeta.profile),
@@ -11170,8 +10783,10 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
     };
 
     let result = await this.impl.addGatekeeper(
-        this.impl.ctx.exports.LanguageModelGatekeeper({props}), creationSpec,
-        this.clientUserId, this.#mintedCapabilityKind());
+        modelKind(props.config.provider, props.config.model) === "decision"
+            ? this.impl.ctx.exports.DecisionModelGatekeeper({props})
+            : this.impl.ctx.exports.LanguageModelGatekeeper({props}),
+        creationSpec, this.clientUserId, this.#mintedCapabilityKind());
     await this.recordConnectionCreated(result, "ai_model");
     return result;
   }
@@ -11253,7 +10868,7 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
     };
   }
 
-  async approveAction(id: number): Promise<void> {
+  async approveAction(id: number, creation?: CreationApproval): Promise<void> {
     let action = this.impl.storage.actions.get(id);
     if (!action) {
       throw new Error(`No such action: ${id}`);
@@ -11272,7 +10887,12 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
     // Resolve the approver's identity before applying, so a failed profile fetch can't leave the
     // action applied in the world but still "pending" in storage.
     let profile = await this.#getClientProfile();
-    await this.impl.applyPendingAction(action, profile, false);
+    // A creation is made in the account the approver chose, whose verifier carries its authority.
+    let vendorId = gatekeeperVendorId(this.impl.storage.gatekeepers.get(action.gatekeeperId));
+    let creator = action.action === "create" && creation && vendorId
+        ? await this.#clientUser.getVerifier(creation.accountId, vendorId) : null;
+    await this.impl.applyPendingAction(action, profile, false,
+        creator ? {creator, configuration: creation?.configuration ?? null} : undefined);
 
     // If this was an awaited agent action, resume only after all awaited actions in the turn are
     // approved. If applyPendingAction throws, the action stays pending and the turn stays suspended.
@@ -11387,7 +11007,7 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
   async #maybeResumeAfterActionDecision(chatId: number, approvedId: number): Promise<void> {
     let awaited: (ActionRecord & {type: "action"})[] = [];
     for (let msg of this.impl.storage.chats.list(
-        {prefix: `${keyString(chatId)}.`, reverse: true})) {
+        {prefix: chatKeyPrefix(chatId), reverse: true})) {
       // Stop at whatever started the current turn: a user/gadget message or a gadget callback.
       // (agentNudge is mid-turn, so it isn't a boundary.)
       if (msg.type === "agentCallback") break;
@@ -11437,7 +11057,27 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
       throw new Error(`Can't reject an observation: ${id}`);
     }
 
-    let gatekeeper = this.impl.getGatekeeperFacet(action.gatekeeperId);
+    if (action.action === "create") {
+      // Rejecting a creation removes its connection, as disconnecting would (clearing queued
+      // pushes' marks), and rejects every action queued against the simulated resource: none can
+      // apply now. Their gatekeeper-side state goes with the facet's storage, so no rejectAction()
+      // is called.
+      let profile = await this.#getClientProfile();
+      let queued = Array.from(
+          this.impl.storage.actions.pendingByGatekeeper.get(action.gatekeeperId));
+      this.impl.removeGatekeeper(action.gatekeeperId);
+      for (let record of queued) {
+        if (record.type !== "action") continue;
+        record.state = "rejected";
+        record.appliedAt = new Date();
+        record.resolvedBy = profile;
+        this.impl.storage.actions.put(record);
+        this.impl.traceAgentActionApproval(record, "denied");
+      }
+      return;
+    }
+
+    let gatekeeper = await this.impl.getGatekeeperFacet(action.gatekeeperId);
 
     // Resolve the rejecter's identity before notifying the gatekeeper, so a failed profile fetch
     // can't leave the action rejected with the gatekeeper but still "pending" in storage.
@@ -11516,7 +11156,7 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
         .map(id => this.impl.storage.gatekeepers.get(id))
         .filter(gk => gk !== undefined)
         .map(async (gk): Promise<PreApprovableAction[]> => {
-      let facet = this.impl.getGatekeeperFacet(gk.id);
+      let facet = await this.impl.getGatekeeperFacet(gk.id);
       let kinds = await facet.getAutoApprovableActions();
       return kinds.map(actionKind => ({
         gatekeeperId: gk.id,
@@ -11542,7 +11182,7 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
     let chatId = Number(requestId.slice(0, colonIdx));
     if (!Number.isFinite(chatId)) throw new Error(`Malformed connection request id: ${requestId}`);
 
-    for (let msg of this.impl.storage.chats.list({prefix: `${keyString(chatId)}.`})) {
+    for (let msg of this.impl.storage.chats.list({prefix: chatKeyPrefix(chatId)})) {
       if (msg.type === "connectionRequest" && msg.requestId === requestId) {
         return msg as AiChatMessage & {type: "connectionRequest"};
       }
@@ -11560,16 +11200,34 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
 
     // Recover the model this thread was using. getChatContext(null) does NOT resolve a model, so we
     // find the id from the most recent agent-authored message (its author.id is the model id).
-    let modelId: string | null = null;
-    for (let msg of this.impl.storage.chats.list({prefix: `${keyString(chatId)}.`, reverse: true})) {
+    let agent: AiChatAuthorInfo | undefined;
+    for (let msg of this.impl.storage.chats.list({prefix: chatKeyPrefix(chatId), reverse: true})) {
       if (msg.author.type === "agent") {
-        modelId = msg.author.id;
+        agent = msg.author;
         break;
       }
     }
 
-    let userMeta = await retryOnDoReset(
-        () => this.#clientUser.getChatContext(modelId), this.impl.logger);
+    let userMeta: UserChatContext;
+    try {
+      userMeta = await retryOnDoReset(
+          () => this.#clientUser.getChatContext(agent?.id ?? null), this.impl.logger);
+    } catch (err) {
+      // The outcome that triggered this resume is already recorded, so the caller's approval or
+      // accept must not fail because the thread's model stopped resolving (deleted, or disabled by
+      // an administrator). Say why in the chat, as that agent, and leave the turn ended. With no
+      // agent message there is no one to attribute the error to.
+      if (!agent) throw err;
+      this.impl.logger.error("error resolving model while resuming suspended agent", {
+        event: "agent.resume.suspended.model.resolve.failed",
+        chatId, modelId: agent.id, error: err,
+      });
+      // A turn that started during the lookup is not waiting on this one.
+      if (this.impl.storage.chatMeta.get(chatId)?.activeAgent) return;
+      this.impl.postAgentErrorMessage(chatId, agent,
+          `The agent could not be resumed: ${stringifyError(err)}`);
+      return;
+    }
     if (!userMeta.aiModel) return;  // No model resolved; nothing to resume.
 
     let preparation = this.impl.waitForChatMessagePreparation(chatId);
@@ -11610,7 +11268,7 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
     // Don't resume until every connection request from this turn was accepted. Scanning newest
     // first bounds the lookup to the current turn and usually finds a pending sibling immediately.
     for (let sibling of this.impl.storage.chats.list(
-        {prefix: `${keyString(msg.chatId)}.`, reverse: true})) {
+        {prefix: chatKeyPrefix(msg.chatId), reverse: true})) {
       if (sibling.type === "connectionRequest" && sibling.state !== "accepted") return;
       if (sibling.type === "agentCallback" ||
           (sibling.type === "message" &&
@@ -11781,9 +11439,9 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
         ? this.impl.getActiveChatCompaction(chatId)
         : this.impl.getChatCompactionBelow(chatId, beforeSequence);
     let result = [...this.impl.storage.chats.list({
-      prefix: `${keyString(chatId)}.`,
-      start: checkpoint && compactionKey(chatId, checkpoint.compactedTo),
-      end: beforeSequence === undefined ? undefined : compactionKey(chatId, beforeSequence),
+      prefix: chatKeyPrefix(chatId),
+      start: checkpoint && chatKey(chatId, checkpoint.compactedTo),
+      end: beforeSequence === undefined ? undefined : chatKey(chatId, beforeSequence),
     })];
     return {
       messages: result.map((msg) => this.#getChatMessageForClient(msg)),
@@ -11796,11 +11454,11 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
   }
 
   async getChatMessage(chatId: number, sequence: number): Promise<AiChatMessage | undefined> {
-    let msg = this.impl.storage.chats.get(`${keyString(chatId)}.${keyString(sequence)}`);
+    let msg = this.impl.storage.chats.get(chatKey(chatId, sequence));
     return msg && this.#getChatMessageForClient(msg);
   }
 
-  #getChatMessageForClient(msg: AiChatMessage): AiChatMessage {
+  #getChatMessageForClient(msg: StoredChatMessage): AiChatMessage {
     if (msg.type === "action") {
       let record = this.impl.storage.actions.get(msg.actionId);
       if (record) {
@@ -11975,32 +11633,30 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
     await this.impl.removeChatWorkpieces(chatId);
     this.impl.storage.chatMeta.delete(chatId);
     this.impl.storage.chatContext.delete(chatId);
-    // Buffer the keys first: deleting invalidates the list cursor.
-    let checkpoints = Array.from(
-        this.impl.storage.chatCompactions.list({prefix: `${keyString(chatId)}.`}),
-        checkpoint => compactionKey(chatId, checkpoint.compactedTo));
-    for (let key of checkpoints) this.impl.storage.chatCompactions.delete(key);
+    // Buffer the checkpoints first: deleting invalidates the list cursor.
+    for (let checkpoint of Array.from(
+        this.impl.storage.chatCompactions.list({prefix: chatKeyPrefix(chatId)}))) {
+      this.impl.storage.chatCompactions.deleteRecord(checkpoint);
+    }
 
     // The chat's change stream: rows (retired included), the straggler-bridge boundary, and the
     // per-client dedupe records (which live exactly as long as the chat -- see submitCodeChange).
     this.impl.deleteAllChatChanges(chatId);
     for (let record of Array.from(this.impl.storage.chatChangeClients.list(
-        {prefix: `${keyString(chatId)}.`}))) {
-      this.impl.storage.chatChangeClients.delete(
-          `${keyString(record.chatId)}.${record.userId}:${record.clientId}`);
+        {prefix: chatKeyPrefix(chatId)}))) {
+      this.impl.storage.chatChangeClients.deleteRecord(record);
     }
 
     // Any pre-conversion legacy drafts (see ChatDraftUpdateRecord).
     for (let draft of Array.from(this.impl.storage.chatDraftUpdates.list(
-        {prefix: `${keyString(chatId)}.`}))) {
-      this.impl.storage.chatDraftUpdates.delete(
-          `${keyString(draft.chatId)}.${keyString(draft.timestamp.valueOf())}`);
+        {prefix: chatKeyPrefix(chatId)}))) {
+      this.impl.storage.chatDraftUpdates.deleteRecord(draft);
     }
 
     // Delete the chat's messages and the attachment content referenced by them. Attachment metadata
     // is canonical in each message's ChatAttachmentRef, so no separate attachment index is needed.
     this.impl.ctx.storage.transactionSync(() => {
-      for (let msg of this.impl.storage.chats.list({prefix: `${keyString(chatId)}.`})) {
+      for (let msg of this.impl.storage.chats.list({prefix: chatKeyPrefix(chatId)})) {
         if (msg.type === "message") {
           for (let attachment of msg.attachments ?? []) {
             let content = this.impl.storage.chatAttachmentContent.get(attachment.id);
@@ -12009,27 +11665,24 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
             }
           }
         }
-        this.impl.storage.chats.delete(`${keyString(msg.chatId)}.${keyString(msg.sequence)}`);
+        this.impl.storage.chats.deleteRecord(msg);
       }
     });
 
     // Clean up agentCallbackArgs for this chat, and any calls to its agent not yet delivered.
     for (let entry of this.impl.storage.agentCallbackArgs.list(
-        {prefix: `${keyString(chatId)}.`})) {
-      this.impl.storage.agentCallbackArgs.delete(
-          `${keyString(entry.chatId)}.${keyString(entry.sequence)}`);
+        {prefix: chatKeyPrefix(chatId)})) {
+      this.impl.storage.agentCallbackArgs.deleteRecord(entry);
     }
     for (let entry of Array.from(this.impl.storage.pendingAgentCalls.list(
-        {prefix: `${keyString(chatId)}.`}))) {
-      this.impl.storage.pendingAgentCalls.delete(
-          `${keyString(entry.chatId)}.${keyString(entry.callId)}`);
+        {prefix: chatKeyPrefix(chatId)}))) {
+      this.impl.storage.pendingAgentCalls.deleteRecord(entry);
     }
 
     // Clean up the chat's model-facing snapshots.
     for (let entry of this.impl.storage.chatModelData.list(
-        {prefix: `${keyString(chatId)}.`})) {
-      this.impl.storage.chatModelData.delete(
-          `${keyString(entry.chatId)}.${keyString(entry.sequence)}`);
+        {prefix: chatKeyPrefix(chatId)})) {
+      this.impl.storage.chatModelData.deleteRecord(entry);
     }
 
     // Defensively drop any resume record so a deleted chat is never resumed. (Aborting the agent
@@ -12098,9 +11751,28 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
         codeVersionDate: await this.#blueprintCodeDate(record),
         screenshotUrl: blueprintScreenshotUrl(record.id, record.metadata),
         dirty: record.dirty,
+        ...(await this.#hasUnpublishedChanges(record) ? {unpublishedChanges: true} : {}),
       });
     }
     return result;
+  }
+
+  // Whether the gadget a blueprint exports has committed files other than the ones the
+  // blueprint last published, which are those of the record's `commitId`. A gadget that has
+  // since been removed has nothing left to publish, and a record from before git-backed code
+  // storage has no commit to compare with until it is migrated.
+  //
+  // The trees are what is compared, not the commits: publishing an unchanged tree mints nothing
+  // and leaves `commitId` where it was (see mintBlueprintRelease), so a head that has moved on
+  // to the same files would otherwise count as a change that no publish could clear.
+  async #hasUnpublishedChanges(record: BlueprintGadgetRecord): Promise<boolean> {
+    let gadgetId = record.gadgetId ?? this.impl.defaultGadgetId;
+    let gadget = gadgetId === undefined ? undefined : this.impl.storage.gadgets.get(gadgetId);
+    let head = gadget?.type === "gadget" ? gadget.commitId : undefined;
+    let published = record.commitId;
+    if (head === undefined || published === undefined || head === published) return false;
+    let store = this.impl.gitStore;
+    return await store.commitTree(head) !== await store.commitTree(published);
   }
 
   // The timestamp of the code exported into a blueprint: the exported commit's author date, or
@@ -12138,7 +11810,7 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
       record.metadata.description = options.description;
     }
 
-    let codeSnapshot: Uint8Array | undefined;
+    let pack: Uint8Array | undefined;
     if (options.updateCode || options.updateBindings) {
       // Re-collect binding metadata from the source gadget (validates annotations). Records
       // written before multi-gadget support carry no gadgetId; they export the default gadget.
@@ -12147,10 +11819,7 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
       if (options.updateCode) {
         let commitId = await this.impl.assertPublishableCommit(
             this.impl.getGadgetRecord(gadgetId).commitId);
-        record.commitId = commitId;
-        delete record.codeVersion;
-        record.metadata.version++;
-        codeSnapshot = await this.impl.snapshotCode(commitId);
+        pack = await this.impl.mintBlueprintRelease(record, commitId);
       }
     }
 
@@ -12160,7 +11829,7 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
 
     record.metadata.lastUpdated = new Date();
 
-    await this.impl.propagateBlueprint(record, codeSnapshot, screenshot);
+    await this.impl.propagateBlueprint(record, pack, screenshot);
   }
 
   async deleteBlueprint(blueprintId: string): Promise<void> {
@@ -12182,15 +11851,16 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
     if (!record) throw new Error("No such blueprint.");
     if (!record.dirty) return;  // nothing to retry
 
-    // Reconstruct the code snapshot at the originally exported commit, not the current code.
-    if (record.commitId === undefined) {
-      // A record with `codeVersion` instead predates git-backed code storage; one with neither
-      // shouldn't exist, but either way the fix is the same.
-      throw new Error("This blueprint predates git-backed code storage. Republish its code " +
-          "with updateBlueprint instead of retrying.");
+    if (record.releases === undefined) {
+      // The record was last published before releases were commits, in a form that is no longer
+      // written. Republishing its code gives it a release.
+      throw new Error("This blueprint was last published in an older format. Republish its " +
+          "code with updateBlueprint instead of retrying.");
     }
-    let codeSnapshot = await this.impl.snapshotCode(record.commitId);
-    await this.impl.propagateBlueprint(record, codeSnapshot);
+
+    // Propagating a dirty record re-sends the release that was being published, not the
+    // current code.
+    await this.impl.propagateBlueprint(record);
   }
 
   // --- Collaborator management ---
@@ -12363,15 +12033,13 @@ class UseOverseerInterface extends RpcTarget implements Overseer {
   // Fresh stub per call; see OverseerClientInterface.#clientUser.
   get #owner(): DurableObjectStub<UserDurableObject> {
     if (!this.impl.ownerId) throw new Error("Workspace has been deleted.");
-    return wrapDoStubForTelemetry(
-        this.impl.users.get(this.impl.users.idFromString(this.impl.ownerId)),
-        this.impl.logger);
+    return this.impl.wrapUserDo(
+        this.impl.users.get(this.impl.users.idFromString(this.impl.ownerId)));
   }
 
   get #clientUser(): DurableObjectStub<UserDurableObject> {
-    return wrapDoStubForTelemetry(
-        this.impl.users.get(this.impl.users.idFromString(this.clientUserId)),
-        this.impl.logger);
+    return this.impl.wrapUserDo(
+        this.impl.users.get(this.impl.users.idFromString(this.clientUserId)));
   }
 
   #leaveSession: () => void;
@@ -12485,7 +12153,6 @@ class UseOverseerInterface extends RpcTarget implements Overseer {
   // --- Denied methods (build-only) ---
 
   async setTitle(_title: string): Promise<void> { this.#deny(); }
-  async setPinned(_pinned: boolean): Promise<void> { this.#deny(); }
   async deleteSelf(): Promise<void> { this.#deny(); }
   async createGadget(_title: string): Promise<RpcStub<GadgetClient>> { this.#deny(); }
   async submitCodeChange(_chatId: number, _submission: CodeChangeSubmission)
@@ -12495,6 +12162,9 @@ class UseOverseerInterface extends RpcTarget implements Overseer {
   async listTree(_commitId: string): Promise<TreeNode[]> { this.#deny(); }
   async readFilesAtCommit(_commitId: string, _paths: string[])
       : Promise<[path: string, FileAtCommit][]> {
+    this.#deny();
+  }
+  async listChangedPaths(_fromCommit: string, _toCommit: string): Promise<string[]> {
     this.#deny();
   }
   async getCommitLog(_fromCommit: string, _depth?: number): Promise<CommitInfo[]> {
@@ -12646,9 +12316,8 @@ class GadgetClientImpl extends RpcTarget implements GadgetClient {
 
   // Fresh stub per call; see OverseerClientInterface.#clientUser.
   get #clientUser(): DurableObjectStub<UserDurableObject> {
-    return wrapDoStubForTelemetry(
-        this.impl.users.get(this.impl.users.idFromString(this.clientUserId)),
-        this.impl.logger);
+    return this.impl.wrapUserDo(
+        this.impl.users.get(this.impl.users.idFromString(this.clientUserId)));
   }
 
   async getId(): Promise<WorkpieceId> {
@@ -12716,7 +12385,7 @@ class GadgetClientImpl extends RpcTarget implements GadgetClient {
     if (!edge || edge.pending || !this.impl.storage.gatekeepers.get(edge.target)) return null;
     // The child capability counts exactly as this one does: it can outlive this object.
     return new GatekeeperClientImpl(
-        this.impl, edge.target, this.impl.getGatekeeperFacet(edge.target),
+        this.impl, edge.target, await this.impl.getGatekeeperFacet(edge.target),
         this.clientUserId, this.joinedAs);
   }
 
@@ -12749,9 +12418,10 @@ class GadgetClientImpl extends RpcTarget implements GadgetClient {
     }
 
     // The target is client-supplied, so refuse one blocked pending a scope-widening restart
-    // before reaching its facet (metadata-only, but every client-reachable route is gated).
+    // before describing it (metadata-only, but every client-reachable route is gated).
+    let facet = await this.impl.getGatekeeperFacet(target);
     this.impl.assertGatekeeperUsable(target);
-    let description = await this.impl.getGatekeeperFacet(target).describe();
+    let description = await facet.describe();
     let suggestedName = description.suggestedBindingName;
     let i = 1;
     // Re-read the record after the describe() await, in case bindings changed meanwhile. Dedupe
@@ -12846,7 +12516,7 @@ class GadgetClientImpl extends RpcTarget implements GadgetClient {
       description: description || "",
       author: ownerProfile,
       created: now,
-      version: 1,
+      version: 0,  // counts releases; the first is minted below
       lastUpdated: now,
       bindings,
     };
@@ -12861,14 +12531,13 @@ class GadgetClientImpl extends RpcTarget implements GadgetClient {
       id,
       metadata,
       gadgetId: this.id,
-      commitId,
     };
 
     let screenshot = screenshotUpload ? validateBlueprintScreenshotUpload(screenshotUpload) : undefined;
 
-    // Snapshot the committed code and propagate to User DO, KV, R2.
-    let codeSnapshot = await this.impl.snapshotCode(commitId);
-    await this.impl.propagateBlueprint(record, codeSnapshot, screenshot);
+    // Mint the first release of the committed code and propagate to User DO, KV, R2.
+    let pack = await this.impl.mintBlueprintRelease(record, commitId);
+    await this.impl.propagateBlueprint(record, pack, screenshot);
 
     this.impl.recordGadgetAnalytics({
       event_name: "blueprint_created",
@@ -12889,6 +12558,15 @@ class GadgetClientImpl extends RpcTarget implements GadgetClient {
       screenshotUrl: blueprintScreenshotUrl(id, metadata),
       dirty: record.dirty,
     };
+  }
+
+  async applyBlueprint(blueprintId: string,
+                       options: {modelId: string | null, allowUnrelated?: boolean})
+      : Promise<ApplyBlueprintResult> {
+    let userMeta = await retryOnDoReset(
+        () => this.#clientUser.getChatContext(options.modelId), this.impl.logger);
+    return await this.impl.applyBlueprint(
+        this.id, blueprintId, options, userMeta, this.clientUserId);
   }
 }
 
@@ -12915,9 +12593,8 @@ class UseGadgetClientInterface extends RpcTarget implements GadgetClient {
 
   // Fresh stub per call; see OverseerClientInterface.#clientUser.
   get #clientUser(): DurableObjectStub<UserDurableObject> {
-    return wrapDoStubForTelemetry(
-        this.impl.users.get(this.impl.users.idFromString(this.clientUserId)),
-        this.impl.logger);
+    return this.impl.wrapUserDo(
+        this.impl.users.get(this.impl.users.idFromString(this.clientUserId)));
   }
 
   #deny(): never {
@@ -12983,6 +12660,11 @@ class UseGadgetClientInterface extends RpcTarget implements GadgetClient {
       : Promise<void> { this.#deny(); }
   async createBlueprint(_title?: string, _description?: string,
                         _screenshot?: BlueprintScreenshotUpload): Promise<BlueprintGadgetSummary> {
+    this.#deny();
+  }
+  async applyBlueprint(_blueprintId: string,
+                       _options: {modelId: string | null, allowUnrelated?: boolean})
+      : Promise<ApplyBlueprintResult> {
     this.#deny();
   }
 }
@@ -13169,18 +12851,6 @@ class ApprovalQueueImpl extends RpcTarget implements ApprovalQueue {
 }
 
 // =======================================================================================
-
-type AgentSpawnerBindingProps = {
-  // ID of the overseer under which this agent should run.
-  overseerId: string,
-
-  config: AgentSpawnerConfig,
-
-  // DO ID of the user who created this binding. When agents are spawned, the model is
-  // resolved from this user's account. Falls back to the gadget owner for bindings
-  // created before collaborator support was added.
-  creatorUserId?: string,
-};
 
 import AGENT_SPAWNER_BINDING_TYPES from "./agent-spawner-binding.txt";
 

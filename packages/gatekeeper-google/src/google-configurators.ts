@@ -12,6 +12,7 @@ import type { CalendarConfiguratorRpc } from "./configurator/calendar-configurat
 import type { GmailConfiguratorRpc } from "./configurator/gmail-configurator-types";
 import type { GoogleDocConfiguratorRpc } from "./configurator/google-doc-configurator-types";
 import type { GoogleSheetsConfiguratorRpc } from "./configurator/google-sheets-configurator-types";
+import type { GoogleSlidesConfiguratorRpc } from "./configurator/google-slides-configurator-types";
 import type { ConfiguratorOption } from "./configurator/configurator-option";
 import type {
   ChatAccountConfiguratorRpc,
@@ -168,6 +169,10 @@ export class CalendarConfiguratorUI extends RpcTarget implements CalendarConfigu
     return calendarId;
   }
 
+  async canWriteCalendar(calendarId: string): Promise<boolean> {
+    return (await calendarApi(this)).canWriteCalendar(calendarId);
+  }
+
   async listCalendars(query: string): Promise<ConfiguratorOption[]> {
     let options = calendarConfiguratorCaches.get(this);
     if (!options) {
@@ -273,6 +278,21 @@ export class GoogleSheetsConfiguratorUI extends RpcTarget implements GoogleSheet
   async listSpreadsheets(query: string): Promise<ConfiguratorOption[]> {
     return listDriveFiles(
       this, query, "application/vnd.google-apps.spreadsheet", "Google Sheets",
+    );
+  }
+}
+
+// RPC interface exposed by Gatekeeper to the resource selection/configuration iframe.
+@validateRpc()
+export class GoogleSlidesConfiguratorUI extends RpcTarget implements GoogleSlidesConfiguratorRpc {
+  constructor(getToken: () => Promise<GoogleAccessToken>) {
+    super();
+    googleTokenGetters.set(this, getToken);
+  }
+
+  async listPresentations(query: string): Promise<ConfiguratorOption[]> {
+    return listDriveFiles(
+      this, query, "application/vnd.google-apps.presentation", "Google Slides",
     );
   }
 }

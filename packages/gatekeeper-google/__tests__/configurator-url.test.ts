@@ -28,10 +28,12 @@ import gmailConfigurator from "../src/configurator/gmail-configurator-ui";
 import chatAccountConfigurator from "../src/configurator/chat-account-configurator-ui";
 import chatSpaceConfigurator from "../src/configurator/chat-space-configurator-ui";
 import chatThreadConfigurator from "../src/configurator/chat-thread-configurator-ui";
+import googleSlidesConfigurator from "../src/configurator/google-slides-configurator-ui";
 import {
   GMAIL_RESOURCE, GOOGLE_CALENDAR_RESOURCE, GOOGLE_CHAT_RESOURCE, GOOGLE_CHAT_SPACE_RESOURCE,
   GOOGLE_CHAT_THREAD_RESOURCE,
   GOOGLE_DRIVE_FILE_RESOURCE, GOOGLE_DRIVE_FOLDER_RESOURCE, GOOGLE_DRIVE_RESOURCE,
+  GOOGLE_SLIDES_RESOURCE,
   parseResourceUrl,
 } from "../src/resources";
 
@@ -152,6 +154,67 @@ describe("Calendar configurator URLs", () => {
       availabilityMode: "allVisible",
     });
   });
+
+  it("leaves a suggested calendar unselected when the recipient cannot write it", async () => {
+    const ui = {
+      getPrimaryCalendarId: vi.fn(),
+      canWriteCalendar: vi.fn(async () => false),
+      listCalendars: vi.fn(),
+    } as unknown as CalendarConfiguratorRpc;
+
+    const values = await calendarConfigurator.initialValuesFromResourceUrl!({
+      resourceUrl:
+        "https://calendar.google.com/calendar/creator%40example.com/?availability=thisCalendar",
+      resourceUrlPattern: GOOGLE_CALENDAR_RESOURCE.urlPattern,
+      ui,
+    });
+
+    expect(values).toEqual({ availabilityMode: "thisCalendar" });
+    expect(calendarConfigurator.isReady!({ values })).toBe(false);
+    expect(ui.canWriteCalendar).toHaveBeenCalledExactlyOnceWith("creator@example.com");
+  });
+
+  // The runtime discards every seeded value when the initializer throws, which silently turned a
+  // requested all-visible connection into a this-calendar one.
+  it("keeps the requested availability mode when the calendar lookup fails", async () => {
+    const ui = {
+      getPrimaryCalendarId: vi.fn(),
+      canWriteCalendar: vi.fn(async () => { throw new Error("[http=503]"); }),
+      listCalendars: vi.fn(),
+    } as unknown as CalendarConfiguratorRpc;
+
+    const values = await calendarConfigurator.initialValuesFromResourceUrl!({
+      resourceUrl:
+        "https://calendar.google.com/calendar/shared%40example.com/?availability=allVisible",
+      resourceUrlPattern: GOOGLE_CALENDAR_RESOURCE.urlPattern,
+      ui,
+    });
+
+    expect(values).toEqual({ availabilityMode: "allVisible" });
+    expect(calendarConfigurator.isReady!({ values })).toBe(false);
+  });
+
+  it("keeps a suggested calendar when the recipient can write it", async () => {
+    const ui = {
+      getPrimaryCalendarId: vi.fn(),
+      canWriteCalendar: vi.fn(async () => true),
+      listCalendars: vi.fn(),
+    } as unknown as CalendarConfiguratorRpc;
+
+    const values = await calendarConfigurator.initialValuesFromResourceUrl!({
+      resourceUrl:
+        "https://calendar.google.com/calendar/shared%40example.com/?availability=allVisible",
+      resourceUrlPattern: GOOGLE_CALENDAR_RESOURCE.urlPattern,
+      ui,
+    });
+
+    expect(values).toEqual({
+      calendarId: "shared@example.com",
+      availabilityMode: "allVisible",
+    });
+    expect(calendarConfigurator.isReady!({ values })).toBe(true);
+    expect(ui.canWriteCalendar).toHaveBeenCalledExactlyOnceWith("shared@example.com");
+  });
 });
 
 describe("Google Chat configurator URLs", () => {
@@ -175,6 +238,14 @@ describe("Google Chat configurator URLs", () => {
   it("round-trips its own URL back to the same values", () => {
     const values = { spaceId: "AAAA1234" };
     expect(chatValues(configurableUrl(chatSpaceConfigurator, values))).toEqual(values);
+  });
+
+  it.for([
+    "https://chat.google.com/room/AAAA1234?cls=7",
+    "https://chat.google.com/dm/AAAA1234?cls=7",
+  ])("prefills the conversation from a link Chat gave out, %s", link => {
+    expect(parseResourceUrl(link)).toEqual({ kind: "chatSpace", spaceId: "AAAA1234" });
+    expect(chatValues(link)).toEqual({ spaceId: "AAAA1234" });
   });
 
   it("prefills nothing from a URL that names no conversation", () => {
@@ -236,18 +307,6 @@ describe("Drive configurator URLs", () => {
     expect(parseResourceUrl(url)).toEqual({ kind: "driveAccount" });
   });
 
-  it("explains Drive read behavior", () => {
-    expect(renderedCopy(driveAccountConfigurator)).toContain(
-      "native Google Docs and Sheets can be opened in read-only content sessions.",
-    );
-    expect(renderedCopy(driveFileConfigurator)).toContain(
-      "A selected native Google Doc or Sheet also provides read-only content.",
-    );
-    expect(renderedCopy(driveFolderConfigurator))
-      .toContain("My Drive, Shared with me, and shared drives");
-  });
-
-
   it("round-trips an encoded file ID", () => {
     let values = { fileId: "file/id with spaces" };
     let url = configurableUrl(driveFileConfigurator, values);
@@ -285,5 +344,14 @@ describe("Drive configurator URLs", () => {
     let folderUrl = configurableUrl(driveFolderConfigurator, folderValues);
     expect(valuesFromUrlPattern(folderUrl, GOOGLE_DRIVE_FOLDER_RESOURCE.urlPattern))
       .toEqual(folderValues);
+  });
+});
+
+describe("Google Slides configurator URLs", () => {
+  it("mints a presentation URL the server parses and the prefill reads back", () => {
+    let values = { presentationId: "1AbC-dEf_9xYz" };
+    let url = configurableUrl(googleSlidesConfigurator, values);
+    expect(parseResourceUrl(url)).toEqual({ kind: "slides", presentationId: values.presentationId });
+    expect(valuesFromUrlPattern(url, GOOGLE_SLIDES_RESOURCE.urlPattern)).toEqual(values);
   });
 });

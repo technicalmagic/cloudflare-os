@@ -55,7 +55,7 @@ it.concurrent("lists workspace metadata after activity and removes it after dele
   expect(await authenticated.listGadgets()).not.toContainEqual(expect.objectContaining({ id }));
 
   await workspace.setTitle("Renamed Workspace");
-  await workspace.setPinned(true);
+  await authenticated.setWorkspacePinned(id, true);
   await workspace.newChat("Record this without running an agent", null);
 
   const listed = await waitFor("the active workspace to appear in the user's list", async () => {
@@ -142,7 +142,7 @@ it.concurrent("creates, renames, reopens, and removes a Gadget capability", asyn
     .rejects.toThrow('already a gadget named "STATUS"');
 
   await gadget.remove();
-  await expect(workspace.getGadget(gadgetId)).rejects.toThrow();
+  await expect(workspace.getGadget(gadgetId)).rejects.toThrow(`No such gadget: ${gadgetId}`);
   await workspace.deleteSelf();
 });
 

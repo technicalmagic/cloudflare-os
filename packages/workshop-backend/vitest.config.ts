@@ -28,7 +28,7 @@ const textModules: Plugin = {
   },
 }
 
-// Records the agent spans (see src/agent-tracing.ts) this Worker emits, as a streaming tail
+// Records the agent and step-persistence spans this Worker emits, as a streaming tail
 // worker receives them, so tests can read them back through the SPAN_RECORDER binding.
 const spanRecorder = `
 import { WorkerEntrypoint } from "cloudflare:workers";
@@ -40,7 +40,8 @@ export class SpanRecorder extends WorkerEntrypoint {
 export default {
   tailStream() {
     return ({ event, spanContext }) => {
-      if (event.type === "spanOpen" && AGENT_SPAN.test(event.name)) {
+      if (event.type === "spanOpen" &&
+          (AGENT_SPAN.test(event.name) || event.name === "agent.step.persist")) {
         spans.set(event.spanId, {
           name: event.name, spanId: event.spanId, parentSpanId: spanContext.spanId,
           attributes: {}, closed: false,
@@ -87,6 +88,8 @@ export default defineConfig({
         bindings: { PUBLIC_BASE_URL: 'https://workshop.example/' },
         // The overseer loads gadget code through this, so a test can run a real gadget facet.
         workerLoaders: { LOADER: {} },
+        // Where a blueprint's content is published to and read back from.
+        r2Buckets: ['BLUEPRINT_CONTENT'],
         durableObjects: {
           TEST_OVERSEER: { className: 'OverseerDurableObject', useSQLite: true },
           TEST_USER: { className: 'UserDurableObject', useSQLite: true },
@@ -95,6 +98,9 @@ export default defineConfig({
           // which the overseer instantiates it (with props) as one of its own facets.
           TEST_AGENT_SPAWNER: { className: 'AgentSpawnerGatekeeper', useSQLite: true },
           TEST_USER_DIRECTORY: { className: 'UserDirectoryDurableObject', useSQLite: true },
+          // Likewise only reached through `ctx.exports`, by the overseer deleting a blueprint.
+          TEST_ADMIN_SETTINGS: { className: 'AdminSettings', useSQLite: true },
+          TEST_GATEKEEPER_USER_PICKER: { className: 'GatekeeperUserPickerTestHooks', useSQLite: true },
         },
       },
     }),
