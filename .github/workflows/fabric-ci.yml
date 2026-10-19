@@ -2,8 +2,9 @@
 #
 # A NEW filename on purpose: upstream's nine workflow files stay byte-identical so they never
 # conflict on a merge, and upstream will never create a file by this name. Upstream's own ci.yml
-# triggers only on push to `main`, so it does not run on `distro` at all -- without this file the
-# fork has no CI whatsoever.
+# runs on pushes to `main` and, since upstream added `pull_request:`, on pull requests too, so its
+# legs do run on a PR into `distro`; but it never runs on a push to `distro` or `upstream-main`, and
+# `distro`'s required checks are this file's jobs (suite, invariants), not upstream's.
 name: fabric-ci
 
 on:
@@ -47,6 +48,12 @@ jobs:
 
       - run: corepack enable
       - run: pnpm install --frozen-lockfile
+
+      # Upstream's workshop-frontend browser suite (vitest.browser.config.ts, since upstream
+      # e87f72f5, #717) runs in headless Chromium, which Playwright downloads outside node_modules,
+      # so `pnpm test` fails at browserType.launch without it. The same step as upstream's ci.yml.
+      - name: Install Chromium for the browser suite
+        run: pnpm --filter @gadgets/workshop-frontend exec playwright install --with-deps chromium
 
       # Gate A: upstream's own suite, unmodified.
       - run: pnpm run build
