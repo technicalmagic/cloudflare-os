@@ -4,7 +4,7 @@ Every commit on `distro` that modifies an upstream file is recorded here and car
 `PATCH-ID` trailer. CI asserts the two agree, and that `git diff --name-only upstream-main...distro`
 lists nothing but these files plus new-file-only paths.
 
-**The budget is ten patches. Four are committed: two landed, two planned, six free.** (Raised from
+**The budget is ten patches. Five are committed: three landed, two planned, five free.** (Raised from
 three on 2026-09-17, deliberately: carrying a set of patches is expected of this distro, and the
 discipline is to keep each one justified rather than to keep the count artificially small. A patch
 earns its place by directly supporting what Fabric offers that upstream does not.)
@@ -141,3 +141,37 @@ attempt the gatekeeper has not answered.
 **Budget note:** the fourth of ten, and the first taken deliberately in two of the high-churn files.
 Authorised on the grounds above: sign-in did not work at all in an embedded browser, and no
 deployment-side code could reach the token.
+
+---
+
+## `fabric-email-host` — LANDED 2026-10-19
+
+**Files:** `packages/gatekeeper-email/src/email.ts`, `packages/gatekeeper-email/src/fabric-email-host.ts`
+
+**Why no seam:** the email gatekeeper names every mailbox by its name, an at sign and a host, and the host is
+`getEmailHost()`, BASE_URL's hostname with no override (`email.ts`). BASE_URL must be where the router
+serves the gatekeeper, since its fetch handler refuses any other path, and Fabric's router is on
+workers.dev, which has no zone, so no mail can arrive at the name it gives. Inbound routing reads only
+the local part, so mail sent to the real domain arrives; but `getAddress()` and the binding's
+description tell the gadget and the member the wrong address. Nothing outside the Worker can change what
+`getEmailHost()` returns.
+
+**Why it was needed:** Chris chose, 2026-10-19, to enable Cloudflare Email Routing for gadget mailboxes
+on a subdomain of technicalmagic.ai (never the apex, whose mail is Google Workspace's), with "a small
+kernel patch" for the host rather than moving the router to a custom domain.
+
+**Shape:** `getEmailHost()` returns `emailHostFrom(env, getBaseUrl(env))`: `EMAIL_HOST` if set, else
+BASE_URL's hostname, so a deployment that sets nothing is unchanged. The logic is in a new file,
+`src/fabric-email-host.ts`; `email.ts` gains an import, one `Env` field and the one return line, inside
+the function whose TODO already asks for "the env var that specifies the default host".
+
+**Review if:** upstream changes `getEmailHost()` or its TODO, or adds a host setting of its own -- which
+would retire this patch.
+
+**Covered by:** Fabric's `scripts/kernel-email-host.test.ts` (node:test, in the Fabric repository, so it
+adds nothing to this tree): EMAIL_HOST wins, is trimmed and lowercased, and an unset or blank one falls
+back to BASE_URL's host. The email package has no test task upstream, and giving it one would touch its
+`package.json`, `vite.config.ts` and the lockfile.
+
+**Budget note:** the fifth of ten. One upstream file, low churn (upstream last changed `gatekeeper-email/src/email.ts`
+on 2026-09-09), and none of the high-churn files.

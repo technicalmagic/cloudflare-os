@@ -1,3 +1,4 @@
+import { emailHostFrom } from "./fabric-email-host.js";
 import { WorkerEntrypoint, DurableObject, RpcTarget, RpcStub } from "cloudflare:workers";
 import { skipRpcValidation, validateRpc } from "capnweb-validate";
 import {
@@ -64,6 +65,8 @@ type Env = Cloudflare.Env & {
   // Base URL (protocol+host+optional path) at which the default fetch handler is served. Should
   // NOT include a trailing slash. Omit for localhost dev server.
   BASE_URL?: string,
+  // Fabric patch `fabric-email-host`: the domain mailboxes are addressed at, when it is not BASE_URL's.
+  EMAIL_HOST?: string,
 }
 
 function getBaseUrl(env: Env) {
@@ -95,7 +98,8 @@ function getEmailHost(env: Env) {
   //   routing purposes. At present the returned host isn't really used anywhere important so
   //   maybe we can get rid of this entirely, or maybe we should bring back the env var that
   //   specifies the default host.
-  return new URL(getBaseUrl(env)).hostname;
+  // Fabric patch `fabric-email-host`: that env var, EMAIL_HOST, falling back to the line above.
+  return emailHostFrom(env, getBaseUrl(env));
 }
 
 function validateEmailName(value: string | undefined): { ok: true, emailName: string } | { ok: false, message: string } {
