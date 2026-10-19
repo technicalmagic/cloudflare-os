@@ -2,12 +2,13 @@
 //
 // In the silo model each tenant is its own deployment with its own `sharingDomain`. The line that
 // keeps one domain's Context collections unreadable from another is a single early return in
-// ContextVerifier.hasCollectionAccess (library-gatekeeper.ts):
+// ContextVerifier.hasCollectionsAccess (library-gatekeeper.ts; one id at a time as hasCollectionAccess
+// until upstream d420d9bb, #756, batched it):
 //
-//     if (sharingDomain !== this.ctx.props.sharingDomain) return false;
+//     if (sharingDomain !== this.ctx.props.sharingDomain) return collectionIds.map(() => false);
 //
 // Upstream's context-observers.test.ts never reaches it: that suite builds its OWN fake verifier
-// (`let api = { async hasCollectionAccess(...) {...} } as unknown as Fetcher<ContextVerifierApi>`),
+// (`let api = { async hasCollectionsAccess(...) {...} } as unknown as Fetcher<ContextVerifierApi>`),
 // so the real implementation -- and therefore the real domain check -- is untested upstream.
 //
 // This probe calls the real method, and asserts two things:
@@ -43,23 +44,31 @@ describe("Context cross-domain isolation", () => {
   it("refuses a collection request from a foreign sharingDomain", async () => {
     const verifier = verifierOwnedBy(OWN_DOMAIN);
 
-    await expect(verifier.hasCollectionAccess(FOREIGN_DOMAIN, COLLECTION_ID)).resolves.toBe(false);
+    await expect(verifier.hasCollectionsAccess(FOREIGN_DOMAIN, [COLLECTION_ID])).resolves.toEqual([false]);
+  });
+
+  it("refuses every collection of a batch from a foreign sharingDomain, one answer each", async () => {
+    const verifier = verifierOwnedBy(OWN_DOMAIN);
+
+    await expect(verifier.hasCollectionsAccess(FOREIGN_DOMAIN, [COLLECTION_ID, "another", "a-third"]))
+      .resolves.toEqual([false, false, false]);
+    await expect(verifier.hasCollectionsAccess(FOREIGN_DOMAIN, [])).resolves.toEqual([]);
   });
 
   it("refuses it without consulting storage", async () => {
     const verifier = verifierOwnedBy(OWN_DOMAIN);
 
     // Throws via STORAGE_IS_OFF_LIMITS if the early return no longer guards the lookups.
-    await expect(verifier.hasCollectionAccess(FOREIGN_DOMAIN, COLLECTION_ID)).resolves.toBe(false);
+    await expect(verifier.hasCollectionsAccess(FOREIGN_DOMAIN, [COLLECTION_ID])).resolves.toEqual([false]);
   });
 
   it("does not treat a domain prefix as the same domain", async () => {
     const verifier = verifierOwnedBy(OWN_DOMAIN);
 
     // Guards against the check ever becoming startsWith/includes rather than strict equality.
-    await expect(verifier.hasCollectionAccess(`${OWN_DOMAIN}.evil.test`, COLLECTION_ID))
-      .resolves.toBe(false);
-    await expect(verifier.hasCollectionAccess(OWN_DOMAIN.slice(0, -1), COLLECTION_ID))
-      .resolves.toBe(false);
+    await expect(verifier.hasCollectionsAccess(`${OWN_DOMAIN}.evil.test`, [COLLECTION_ID]))
+      .resolves.toEqual([false]);
+    await expect(verifier.hasCollectionsAccess(OWN_DOMAIN.slice(0, -1), [COLLECTION_ID]))
+      .resolves.toEqual([false]);
   });
 });
