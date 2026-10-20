@@ -1448,7 +1448,16 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
   // caller must have already confirmed the vendor sets autoProvisionsAccount (so createAccount is
   // present) and that the user has no account for it yet.
   async #createAutoProvisionedAccount(vendorId: string, vendor: Service<GatekeeperVendor>): Promise<void> {
-    let account = await (vendor as unknown as AccountCreatorStub).createAccount();
+    // FABRIC PATCH (fabric-account-owner): name this user as the account's owner, so a vendor can
+    // charge what the account spends to them. Both minting paths (provisionAmbientAccount and
+    // #provisionMissingAccounts) come through here. profile.id is the identity string this DO is
+    // named by (idFromName); ctx.id.name is no substitute, being absent when the DO was reached
+    // through idFromString(), as the Overseer reaches a workspace's owner. Before the user's account
+    // exists, profile.id is a placeholder, so the call stays upstream's own.
+    let creator = vendor as unknown as AccountCreatorStub;
+    let account = await (this.storage.created.get()
+        ? creator.createAccount({principal: this.storage.profile.get().id})
+        : creator.createAccount());
     // Resolve the description before allocating the id, so a describe() failure doesn't burn a slot.
     let description = await account.describe();
     let accountId = this.storage.nextAccountId.get();

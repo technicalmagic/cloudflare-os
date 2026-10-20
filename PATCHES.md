@@ -4,7 +4,7 @@ Every commit on `distro` that modifies an upstream file is recorded here and car
 `PATCH-ID` trailer. CI asserts the two agree, and that `git diff --name-only upstream-main...distro`
 lists nothing but these files plus new-file-only paths.
 
-**The budget is ten patches. Four are committed: two landed, two planned, six free.** (Raised from
+**The budget is ten patches. Six are committed: four landed, two planned, four free.** (Raised from
 three on 2026-09-17, deliberately: carrying a set of patches is expected of this distro, and the
 discipline is to keep each one justified rather than to keep the count artificially small. A patch
 earns its place by directly supporting what Fabric offers that upstream does not.)
@@ -141,3 +141,65 @@ attempt the gatekeeper has not answered.
 **Budget note:** the fourth of ten, and the first taken deliberately in two of the high-churn files.
 Authorised on the grounds above: sign-in did not work at all in an embedded browser, and no
 deployment-side code could reach the token.
+
+---
+
+## `fabric-account-owner` — LANDED 2026-10-19
+
+**Files:** `packages/workshop-shared/src/gatekeeper.ts`, `packages/workshop-backend/src/user.ts`,
+`packages/gatekeeper-websearch/src/worker.ts`, `packages/gatekeeper-websearch/src/search.ts`,
+`packages/gatekeeper-websearch/src/fabric-account-owner.ts`
+
+**Why no seam:** the Workshop mints an auto-provisioned account with `GatekeeperVendor.createAccount()`
+and no arguments (`#createAutoProvisionedAccount` in `user.ts`), and Web Search mints that account, and
+the gatekeeper class the account hands out, with empty props (`worker.ts`). Its `ApprovalQueue` never
+names the caller either. So a search reaches `env.AI.websearch()` with a gateway, a query, a provider
+and a limit, and nothing downstream of the kernel, Fabric's AI proxy included, can learn whose account
+it came from. A wrapper around the binding cannot add what the gatekeeper was never told.
+
+**Why it was needed:** Chris decided at 2026-10-20 00:14Z, answering "Who pays for a search" on
+technicalmagic/fabric PR 371: "who pays? all tools and models should use and charge energy to the
+owner (currently) and possibly in future if elected for the end-user". For Web Search that is the
+PR's option (a): the workspace owner pays, through a kernel patch. A workspace's ambient Web Search is
+its owner's auto-provisioned account (`ensureAmbientCapsules` in `overseer.ts`), so naming the account's
+owner at mint names the workspace owner on every search, whoever in the workspace runs it.
+
+**Shape:**
+
+- `gatekeeper.ts`: `createAccount?(owner?: {principal: string})`, documented as an attribution that
+  proves and grants nothing. A vendor that declares no parameter is unaffected: capnweb-validate drops
+  an undeclared argument, and the Scheduler, Context Library and test vendors, which skip validation,
+  never read it.
+- `user.ts`: `#createAutoProvisionedAccount`, which both minting paths (`provisionAmbientAccount` and
+  `#provisionMissingAccounts`) reach, passes `{principal: this.storage.profile.get().id}` once the
+  user's account exists, and makes upstream's argument-less call before. `profile.id` is the identity
+  string the DO is named by; `ctx.id.name` is absent when the DO is reached through `idFromString()`,
+  as the Overseer reaches a workspace's owner.
+- gatekeeper-websearch: `createAccount(owner)` mints `WebSearchAccount` with `{props: {principal}}`,
+  refusing a malformed owner; the account gives `WebSearchGatekeeper` the same props; the session
+  passes the principal to `search()`, which adds `principal` to the request only when there is one.
+  The two helpers are in the new `src/fabric-account-owner.ts`. An account with no owner, minted
+  before this patch or by a call that names none, is minted and searches exactly as upstream's does.
+
+**The other side:** the request's `principal` is read by Fabric's AI proxy (`AiProxy.websearch()`),
+which validates it and charges that owner. The proxy refuses any field it does not know, so it must
+accept `principal` before a Web Search built from this patch is deployed against it.
+
+**Review if:** `createAccount` gains a parameter of its own, `#createAutoProvisionedAccount` stops
+being the one place an auto-provisioned account is minted, the user DO stops being named by its
+`profile.id`, or Web Search's request or props change shape. Upstream adding any way for a vendor, an
+account or a search request to name the user it serves would retire this patch.
+
+**Covered by:** `packages/workshop-backend/__tests__/fabric-account-owner.test.ts` (both minting paths
+name the owner, taken from the account's identity rather than the DO's name; before the account exists
+the call is upstream's) and `packages/gatekeeper-websearch/__tests__/fabric-account-owner.test.ts` (the
+owner flows from `createAccount` through both props to the request; no owner, an account with empty
+props, and a malformed owner leave the request or the mint exactly upstream's or refused; the interface's
+argument stays optional, checked by the package's `tsc`). `workshop-shared` has no test task upstream,
+and its change is a type that both suites compile against. Verified to fail without the patch: 4 of
+the backend's 5 cases and 4 of Web Search's 8 go red; the others assert upstream's own behaviour.
+
+**Budget note:** the sixth of ten, numbered after `fabric-email-host` (fork PR 4), which holds the
+fifth. None of the high-churn files. `user.ts` is warm (17 upstream commits since 2026-09-19), but the
+lines patched in it and in `gatekeeper.ts` have not moved since 2026-06-30; the Web Search package
+dates from 2026-10-13.

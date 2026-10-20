@@ -655,13 +655,20 @@ export interface GatekeeperVendor extends WorkerEntrypoint {
 
   /**
    * Mint a NEW connected account, with no OAuth flow. Safe to expose on this public interface: it
-   * only *creates* accounts — it cannot look up or return an existing account — and it takes no
-   * arguments, so it carries no user identity. The Workshop persists the returned account (like an
+   * only *creates* accounts — it cannot look up or return an existing account — and its one
+   * argument confers nothing (see `owner`). The Workshop persists the returned account (like an
    * OAuth-connected account) and treats it as the authority thereafter. Present only on vendors that
    * set VendorDescription.autoProvisionsAccount; callers gate on that flag rather than probing, since
    * RPC stubs cannot report optional-method presence.
+   *
+   * FABRIC PATCH (fabric-account-owner): `owner.principal` names the user the Workshop is minting
+   * the account for: the identity string that names their UserDurableObject. A vendor may keep it in
+   * the account so that what the account spends, such as a metered search, is charged to that user.
+   * It is an attribution, not a credential: it is whatever the holder of the vendor binding says, so
+   * a vendor must never use it to find, verify or act as the user. The Workshop omits it before the
+   * user's account exists. A vendor that declares no parameter is unaffected.
    */
-  createAccount?(): Promise<Fetcher<GatekeeperUser>>;
+  createAccount?(owner?: {principal: string}): Promise<Fetcher<GatekeeperUser>>;
 
   /**
    * Get a gatekeeper class simulating a NEW resource of the creatable type `resourceUrlPattern`,

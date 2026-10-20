@@ -30,11 +30,17 @@ const RESPONSE_SCHEMA = z.object({ items: z.array(RESULT_SCHEMA) });
  * Searches the web for `query` through the Workers AI binding and the `CF_AI_GATEWAY` gateway, or
  * `default` when that is unset. Calls `audit` once, before the query is sent, and throws without
  * sending anything if the query is empty or too long, or `audit` throws.
+ *
+ * FABRIC PATCH (fabric-account-owner): `principal`, the account owner's, is sent as the request's
+ * `principal` so the search can be charged to them. Without one the request is upstream's exactly.
+ * Cloudflare's AiWebSearchRequest has no such field: Fabric binds AI to its own AI proxy, which
+ * reads it.
  */
 export async function search(
   env: { AI: Pick<Ai, "websearch">; CF_AI_GATEWAY?: string },
   query: string,
   audit: (description: ObservationDescription) => Promise<void>,
+  principal?: string,
 ): Promise<WebSearchResult[]> {
   if (query.length === 0 || query.length > MAX_QUERY_CHARS) {
     throw new Error(`A search query must be 1 to ${MAX_QUERY_CHARS} characters.`);
@@ -45,6 +51,7 @@ export async function search(
   const response = await env.AI.websearch({
     gatewayId: env.CF_AI_GATEWAY ?? DEFAULT_GATEWAY, query, provider: PROVIDER,
     limit: MAX_RESULTS,
+    ...(principal === undefined ? {} : { principal }),
   });
   if (!response.ok) {
     // Not the body, which may quote the query back.
