@@ -19,8 +19,6 @@ import type {
   VendorDescription,
 } from "@gadgets/workshop-shared/gatekeeper";
 import { search } from "./search.js";
-// FABRIC PATCH (fabric-account-owner): the account's owner, carried from mint to each search.
-import { ownerFrom, withOwner, type WebSearchOwner } from "./fabric-account-owner.js";
 import type { WebSearchResult, WebSearchSession } from "./types.js";
 import TYPES_CODE from "./types.txt";
 
@@ -37,19 +35,17 @@ const WEB_SEARCH_ICON = {
 class WebSearchSessionImpl extends RpcTarget implements WebSearchSession {
   readonly #env: Cloudflare.Env;
   readonly #approvalQueue: RpcStub<ApprovalQueue>;
-  readonly #principal: string | undefined;
 
-  constructor(env: Cloudflare.Env, approvalQueue: RpcStub<ApprovalQueue>, principal?: string) {
+  constructor(env: Cloudflare.Env, approvalQueue: RpcStub<ApprovalQueue>) {
     super();
     this.#env = env;
     this.#approvalQueue = approvalQueue;
-    this.#principal = principal;
   }
 
   /** Searches the web, recording the query first. */
   search(query: string): Promise<WebSearchResult[]> {
     return search(this.#env, query,
-        description => this.#approvalQueue.authorizeObservation(description), this.#principal);
+        description => this.#approvalQueue.authorizeObservation(description));
   }
 
   [Symbol.dispose](): void {
@@ -59,7 +55,7 @@ class WebSearchSessionImpl extends RpcTarget implements WebSearchSession {
 
 @validateRpc()
 export class WebSearchGatekeeper
-  extends DurableObject<Cloudflare.Env, WebSearchOwner>
+  extends DurableObject<Cloudflare.Env>
   implements Gatekeeper<WebSearchSession>
 {
   /** Describes the ambient Web Search binding. */
@@ -86,7 +82,7 @@ export class WebSearchGatekeeper
   /** Opens a session that records each query through `approvalQueue`. */
   async startSession(approvalQueue: RpcStub<ApprovalQueue>): Promise<WebSearchSession> {
     // The queue is disposed when this call returns, so the session keeps its own copy.
-    return new WebSearchSessionImpl(this.env, approvalQueue.dup(), this.ctx.props?.principal);
+    return new WebSearchSessionImpl(this.env, approvalQueue.dup());
   }
 
   /** Returns no catalog: the binding's types say everything there is to know. */
@@ -116,10 +112,7 @@ export class WebSearchGatekeeper
 }
 
 @validateRpc()
-export class WebSearchAccount
-  extends WorkerEntrypoint<Cloudflare.Env, WebSearchOwner>
-  implements GatekeeperUser
-{
+export class WebSearchAccount extends WorkerEntrypoint<Cloudflare.Env> implements GatekeeperUser {
   /** Describes the account: an agent singleton and no management UI. */
   async describe(): Promise<AccountDescription> {
     return {
@@ -129,9 +122,9 @@ export class WebSearchAccount
     };
   }
 
-  /** Returns the workspace facet class, carrying the account's owner when it has one. */
+  /** Returns the workspace facet class. */
   async getSingletonGatekeeperClass(): Promise<DurableObjectClass<Gatekeeper<WebSearchSession>>> {
-    return this.ctx.exports.WebSearchGatekeeper(withOwner(this.ctx.props));
+    return this.ctx.exports.WebSearchGatekeeper({});
   }
 
   /** Returns no URL-addressed resources. */
@@ -198,13 +191,10 @@ export class GatekeeperVendor extends WorkerEntrypoint<Cloudflare.Env> {
     };
   }
 
-  /**
-   * Mints a new account. All accounts are alike: none holds credentials or state. One minted with an
-   * `owner` names that owner in each search it sends; see fabric-account-owner.ts.
-   */
+  /** Mints a new account. All accounts are alike: none holds credentials or state. */
   @skipRpcValidation()
-  async createAccount(owner?: { principal: string }): Promise<Fetcher<GatekeeperUser>> {
-    return this.ctx.exports.WebSearchAccount(withOwner(ownerFrom(owner)));
+  async createAccount(): Promise<Fetcher<GatekeeperUser>> {
+    return this.ctx.exports.WebSearchAccount({});
   }
 
   connectAccount(
