@@ -185,6 +185,15 @@ owner at mint names the workspace owner on every search, whoever in the workspac
 which validates it and charges that owner. The proxy refuses any field it does not know, so it must
 accept `principal` before a Web Search built from this patch is deployed against it.
 
+**Deploy precondition:** Fabric must not switch Web Search on at a kernel pin without this patch. The
+package exists without it (since 2026-10-13), so a deploy at such a pin would mint accounts that name
+no owner, and nothing gives one an owner afterwards: the Workshop mints one auto-provisioned account
+per vendor, and in Enabled mode never mints it again. Only a member who removes and re-adds Web Search
+in Optional mode gets a new account. Fabric's proxy, as its PR 388 builds it, serves a search that
+names nobody free in shadow billing and refuses it under enforce, so those members' searches would
+stop once billing is enforced. A deploy can tell a pin that carries this patch by the file
+`packages/gatekeeper-websearch/src/fabric-account-owner.ts`.
+
 **Review if:** `createAccount` gains a parameter of its own, `#createAutoProvisionedAccount` stops
 being the one place an auto-provisioned account is minted, the user DO stops being named by its
 `profile.id`, or Web Search's request or props change shape. Upstream adding any way for a vendor, an
@@ -192,12 +201,13 @@ account or a search request to name the user it serves would retire this patch.
 
 **Covered by:** `packages/workshop-backend/__tests__/fabric-account-owner.test.ts` (both minting paths
 name the owner, taken from the account's identity rather than the DO's name; before the account exists
-the call is upstream's) and `packages/gatekeeper-websearch/__tests__/fabric-account-owner.test.ts` (the
+the call is upstream's; an account minted without an owner is never minted again, the reason for the
+deploy precondition) and `packages/gatekeeper-websearch/__tests__/fabric-account-owner.test.ts` (the
 owner flows from `createAccount` through both props to the request; no owner, an account with empty
 props, and a malformed owner leave the request or the mint exactly upstream's or refused; the interface's
 argument stays optional, checked by the package's `tsc`). `workshop-shared` has no test task upstream,
 and its change is a type that both suites compile against. Verified to fail without the patch: 4 of
-the backend's 5 cases and 4 of Web Search's 8 go red; the others assert upstream's own behaviour.
+the backend's 6 cases and 4 of Web Search's 8 go red; the others assert upstream's own behaviour.
 
 **Budget note:** the sixth of ten, numbered after `fabric-email-host` (fork PR 4), which holds the
 fifth. None of the high-churn files. `user.ts` is warm (17 upstream commits since 2026-09-19), but the

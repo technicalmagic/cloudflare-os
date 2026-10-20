@@ -143,4 +143,27 @@ describe("an auto-provisioned account's owner", () => {
       expect(minted).toStrictEqual([[{ principal }]]);
     });
   });
+
+  it("is never added later: an account minted without one keeps none, even in Enabled mode", async () => {
+    // Why Fabric must not switch Web Search on at a kernel pin without this patch: an account that
+    // pin mints names nobody, and nothing here gives it an owner afterwards. The Workshop mints one
+    // auto-provisioned account per vendor and, in Enabled mode, never mints it again. The owner-less
+    // account is minted here before the user's account exists, which makes the same argument-less
+    // call a pin without the patch makes. This is upstream's behaviour: if it starts failing,
+    // upstream re-mints, and PATCHES.md's deploy precondition can be revisited.
+    const principal = newPrincipal();
+    await withWebSearch(principal, {}, async (user, minted) => {
+      await user.provisionAmbientAccount("websearch");
+      expect(minted).toStrictEqual([[]]);
+    });
+    await signIn(principal, principal);
+
+    await withWebSearch(principal, { websearch: "enabled" }, async (user, minted) => {
+      await user.listProvidedAccounts();
+      await user.provisionAmbientAccount("websearch");
+
+      expect(minted).toStrictEqual([]);
+      expect(autoProvisioned(user)).toEqual(["websearch"]);
+    });
+  });
 });
