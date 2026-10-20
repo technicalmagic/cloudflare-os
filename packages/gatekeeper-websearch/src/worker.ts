@@ -18,6 +18,7 @@ import type {
   SupportedResource,
   VendorDescription,
 } from "@gadgets/workshop-shared/gatekeeper";
+import { workerVersionTag } from "@gadgets/workshop-shared/gatekeeper";
 import { search } from "./search.js";
 // FABRIC PATCH (fabric-account-owner): the account's owner, carried from mint to each search.
 import { ownerFrom, withOwner, type WebSearchOwner } from "./fabric-account-owner.js";
@@ -196,6 +197,11 @@ export class GatekeeperVendor extends WorkerEntrypoint<Cloudflare.Env> {
       autoProvisionsAccount: true,
       providesAuth: false,
     };
+  }
+
+  /** The version tag of this Worker's running version, for the deployment's admins. */
+  async versionTag(): Promise<string | undefined> {
+    return workerVersionTag(this.env);
   }
 
   /**
