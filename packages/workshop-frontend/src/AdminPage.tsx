@@ -1,15 +1,24 @@
 import { useState, useEffect, useRef, type ChangeEvent } from 'react'
 import { RpcStub } from 'capnweb'
-import { Switch, Textarea, Input, Button, Tabs, useKumoToastManager } from '@cloudflare/kumo'
+import { useNavigate, useSearch } from '@tanstack/react-router'
+import { Switch, Textarea, Input, Button, Tabs, Loader, useKumoToastManager } from '@cloudflare/kumo'
 import { Hexagon, MagnifyingGlass, ShieldWarning, UserPlus } from '@phosphor-icons/react'
 import { useAuthenticatedApi } from './AuthContext'
-import { AdminApi, AdminFormat, AdminResourceVendor, AdminSettingsView, AmbientGatekeeperMode, MAX_INSTANCE_INSTRUCTIONS_LENGTH, MAX_ANNOUNCEMENT_LENGTH, MAX_SITE_NAME_LENGTH, DEFAULT_SITE_NAME, BannerColor, BANNER_COLORS, DEFAULT_BANNER_COLOR } from '@gadgets/workshop-shared/api'
+import { AdminApi, AdminFormat, AdminResourceVendor, AdminSettingsView, AmbientGatekeeperMode, DeploymentUpdateStatus, MAX_INSTANCE_INSTRUCTIONS_LENGTH, MAX_ANNOUNCEMENT_LENGTH, MAX_SITE_NAME_LENGTH, DEFAULT_SITE_NAME, BannerColor, BANNER_COLORS, DEFAULT_BANNER_COLOR } from '@gadgets/workshop-shared/api'
 import { applyAccentColor, DEFAULT_ACCENT_COLOR } from './theme'
 import { cacheBustSiteLogoUrl, prepareSiteLogo } from './siteLogoUtils'
 import SiteLogo from './components/SiteLogo'
 import { useDocumentTitle } from './useDocumentTitle'
 import AdminFormatsPanel from './components/format/AdminFormatsPanel'
 import { AdminModelsPanel } from './features/ai-models/AdminModelsPanel'
+import { AdminUpdatesPanel } from './features/deployment-updates/AdminUpdatesPanel'
+import { AdminAuditPanel } from './features/admin-audit/AdminAuditPanel'
+import { auditSettingsOf, type AuditSettings } from './features/admin-audit/auditSettings'
+import { latestReads } from './features/deployment-updates/latestReads'
+import { probeRouterTag } from './features/deployment-updates/probeRouterTag'
+import { RestrictedWebFetchCard } from './features/web-fetch/RestrictedWebFetchCard'
+import { isAdminTab, resolveAdminTab } from './adminTab'
+import { logRpcFailure } from './rpcErrors'
 
 // Preset accent colors offered in the Theme section ('' = default brand).
 const ACCENT_PRESETS: { label: string; value: string }[] = [
@@ -46,6 +55,10 @@ export default function AdminPage() {
   const [savedInstructions, setSavedInstructions] = useState('')
   const [instructionsDraft, setInstructionsDraft] = useState('')
   const [savingInstructions, setSavingInstructions] = useState(false)
+
+  // What a workspace that has observed restricted data may still fetch.
+  const [restrictedWebFetchHosts, setRestrictedWebFetchHosts] = useState<string[]>([])
+  const [restrictedWebFetchApprovals, setRestrictedWebFetchApprovals] = useState(false)
 
   // Top-bar notice: last-saved value + current editor draft.
   const [savedAnnouncement, setSavedAnnouncement] = useState('')
@@ -85,7 +98,32 @@ export default function AdminPage() {
   const [resourceVendors, setResourceVendors] = useState<AdminResourceVendor[]>([])
   const [resourceBusy, setResourceBusy] = useState<Set<string>>(new Set())
 
-  const [activeTab, setActiveTab] = useState('general')
+  // The update status of a deployment the deploy flow installed, null for any other deployment.
+  // Loaded beside the settings but never holding them up, so it may still be pending.
+  const [updateStatus, setUpdateStatus] = useState<DeploymentUpdateStatus | null | 'pending'>('pending')
+  // Only the latest re-read applies, and a setting whose re-read a later one replaced is shown as
+  // saved only once that later one has applied.
+  const [reloadUpdateStatus] = useState(() => latestReads<DeploymentUpdateStatus | null>(setUpdateStatus))
+
+  // The audit retention, null while the backend is older than the admin audit log and has no Audit
+  // tab.
+  const [auditSettings, setAuditSettings] = useState<AuditSettings | null>(null)
+  // Only the latest re-read applies (see latestReads).
+  const [reloadAuditSettings] = useState(() =>
+    latestReads<AdminSettingsView>((view) => setAuditSettings(auditSettingsOf(view))))
+
+  // The tab lives in the URL so the notice can link to one, and so do the Audit tab's filters;
+  // changing either replaces the history entry on the same route, which keeps this component and
+  // its drafts.
+  const navigate = useNavigate()
+  const { tab: requestedTab, ...auditFilter } = useSearch({ from: '/admin' })
+  const activeTab = resolveAdminTab(requestedTab, {
+    updatesAvailable: updateStatus === 'pending' ? 'pending' : updateStatus !== null,
+    auditAvailable: auditSettings !== null,
+  })
+  const handleTabChange = (tab: string) => {
+    if (isAdminTab(tab)) void navigate({ to: '/admin', search: { tab }, replace: true })
+  }
 
   // Promoted output formats, in menu order (see AdminFormatsPanel).
   const [formats, setFormats] = useState<AdminFormat[]>([])
@@ -109,6 +147,8 @@ export default function AdminPage() {
     setResourceVendors(view.resourceVendors)
     setSavedInstructions(view.instanceInstructions)
     setInstructionsDraft(view.instanceInstructions)
+    setRestrictedWebFetchHosts(view.restrictedWebFetchHosts)
+    setRestrictedWebFetchApprovals(view.restrictedWebFetchApprovals)
     setSavedAnnouncement(view.announcement)
     setAnnouncementDraft(view.announcement)
     setSavedBanner(view.banner)
@@ -118,6 +158,7 @@ export default function AdminPage() {
     setAccentDraft(view.accentColor)
     setFormats(view.formats)
     setGatewayModels(view.gatewayModels)
+    setAuditSettings(auditSettingsOf(view))
   }
 
   // Mint the admin capability once (the access check happens server-side) and load settings.
@@ -141,6 +182,16 @@ export default function AdminPage() {
         }
         stub = api
         setAdmin({ api })
+        // A backend older than the update check rejects this as an unknown method mid-rollout; any
+        // failure means no Updates tab rather than a page that fails to load.
+        probeRouterTag().then(() => api.getUpdateStatus()).then(
+          (status) => { if (!cancelled) setUpdateStatus(status) },
+          (err) => {
+            if (cancelled) return
+            logRpcFailure('Failed to read the deployment update status:', err)
+            setUpdateStatus(null)
+          },
+        )
         applySettings(await api.getSettings())
       } catch (err) {
         if (!cancelled) {
@@ -164,7 +215,7 @@ export default function AdminPage() {
     return () => { applyAccentColor(savedAccent) }
   }, [accentDraft, savedAccent])
 
-  // Re-fetch just the gatekeeper/resource state (used to revert an optimistic toggle on error).
+  // Re-fetch policy: one toggle can affect other resource rows or remove a legacy restriction.
   // Leaves the General-tab drafts untouched.
   const reloadResources = async () => {
     if (!admin) return
@@ -181,11 +232,17 @@ export default function AdminPage() {
       prev.map((v) =>
         v.vendorId !== vendorId || v.autoProvisions
           ? v
-          : { ...v, resources: v.resources.map((r) => (r.urlPattern === urlPattern ? { ...r, enabled } : r)) }
+          : { ...v, resources: v.resources.map((r) => ((r.resourceTypeId ?? r.urlPattern) === urlPattern ? { ...r, enabled } : r)) }
       )
     )
     try {
       await admin.api.setResourceEnabled(vendorId, urlPattern, enabled)
+      await reloadResources().catch(() => {
+        toasts.add({
+          title: 'Change saved, but resource settings could not be refreshed. Reload this page.',
+          variant: 'error',
+        })
+      })
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Update failed'
       toasts.add({ title: message, variant: 'error' })
@@ -427,15 +484,48 @@ export default function AdminPage() {
       <Tabs
         variant="underline"
         value={activeTab}
-        onValueChange={setActiveTab}
+        onValueChange={handleTabChange}
         tabs={[
           { value: 'general', label: 'General' },
           { value: 'gatekeepers', label: 'Gatekeepers' },
           { value: 'formats', label: 'Formats' },
           { value: 'models', label: 'Models' },
           { value: 'access', label: 'Access' },
+          ...(auditSettings !== null ? [{ value: 'audit', label: 'Audit' }] : []),
+          // Also listed while a requested Updates tab waits for the status, so it shows as selected.
+          ...(activeTab === 'updates' || (updateStatus !== null && updateStatus !== 'pending')
+            ? [{ value: 'updates', label: 'Updates' }]
+            : []),
         ]}
       />
+
+      {/* Deploy-flow updates */}
+      {activeTab === 'updates' && (
+        updateStatus === 'pending' || updateStatus === null
+          ? (
+            <div className="flex justify-center py-16">
+              <Loader size="lg" />
+            </div>
+          )
+          : (
+            <AdminUpdatesPanel
+              admin={admin.api}
+              status={updateStatus}
+              onChanged={() => reloadUpdateStatus(() => admin.api.getUpdateStatus())}
+            />
+          )
+      )}
+
+      {/* Admin audit log and its retention */}
+      {activeTab === 'audit' && auditSettings !== null && (
+        <AdminAuditPanel
+          admin={admin.api}
+          settings={auditSettings}
+          onSettingsChanged={() => reloadAuditSettings(() => admin.api.getSettings())}
+          filter={auditFilter}
+          onFilterChange={(filter) => void navigate({ to: '/admin', search: { tab: 'audit', ...filter }, replace: true })}
+        />
+      )}
 
       {/* Standard output formats */}
       {activeTab === 'formats' && admin && (
@@ -858,6 +948,16 @@ export default function AdminPage() {
       </div>
       )}
 
+      {activeTab === 'general' && (
+        <RestrictedWebFetchCard
+          admin={admin.api}
+          hosts={restrictedWebFetchHosts}
+          onSaved={setRestrictedWebFetchHosts}
+          approvals={restrictedWebFetchApprovals}
+          onApprovalsSaved={setRestrictedWebFetchApprovals}
+        />
+      )}
+
       {/* Gatekeeper resources */}
       {activeTab === 'gatekeepers' && (
         <div className="bg-kumo-elevated border border-kumo-line rounded-xl p-6">
@@ -974,18 +1074,18 @@ export default function AdminPage() {
                 {vendor.enabled ? (
                   <div className="space-y-1">
                     {vendor.resources.map((resource) => {
-                      const key = resourceKey(vendor.vendorId, resource.urlPattern)
+                      const key = resourceKey(vendor.vendorId, (resource.resourceTypeId ?? resource.urlPattern))
                       return (
                         <div
-                          key={resource.urlPattern}
+                          key={(resource.resourceTypeId ?? resource.urlPattern)}
                           role="button"
                           tabIndex={0}
-                          onClick={() => !resourceBusy.has(key) && handleResourceToggle(vendor.vendorId, resource.urlPattern, !resource.enabled)}
+                          onClick={() => !resourceBusy.has(key) && handleResourceToggle(vendor.vendorId, (resource.resourceTypeId ?? resource.urlPattern), !resource.enabled)}
                           onKeyDown={(e) => {
                             if (e.currentTarget !== e.target) return
                             if (e.key === 'Enter' || e.key === ' ') {
                               e.preventDefault()
-                              if (!resourceBusy.has(key)) handleResourceToggle(vendor.vendorId, resource.urlPattern, !resource.enabled)
+                              if (!resourceBusy.has(key)) handleResourceToggle(vendor.vendorId, (resource.resourceTypeId ?? resource.urlPattern), !resource.enabled)
                             }
                           }}
                           className="flex cursor-pointer items-center gap-4 px-3 py-2.5 rounded-lg hover:bg-kumo-tint transition-colors"
@@ -1001,7 +1101,7 @@ export default function AdminPage() {
                               checked={resource.enabled}
                               disabled={resourceBusy.has(key)}
                               onCheckedChange={(enabled) =>
-                                handleResourceToggle(vendor.vendorId, resource.urlPattern, enabled)
+                                handleResourceToggle(vendor.vendorId, (resource.resourceTypeId ?? resource.urlPattern), enabled)
                               }
                             />
                           </span>

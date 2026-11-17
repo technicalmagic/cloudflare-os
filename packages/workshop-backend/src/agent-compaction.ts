@@ -12,8 +12,11 @@ import {zeroUsage} from "./ai-invoke";
 // the UI can still page back through them, but agent replay starts at the boundary.
 
 // Target this share of the input budget for retained messages, leaving room for the summary and
-// the turns that follow.
+// the turns that follow, but target no more than COMPACTION_TAIL_TOKEN_LIMIT: on a large window a
+// share would keep hundreds of thousands of tokens, and compaction would free little of the prompt.
+// The cut lands at a record start, so the tail can pass the target by up to one record.
 const COMPACTION_TARGET_RATIO = 0.3;
+const COMPACTION_TAIL_TOKEN_LIMIT = 20_000;
 
 // Assumed window for a model that SUGGESTED_MODELS doesn't list. A model whose real window is
 // smaller still fails at the provider before compaction triggers.
@@ -75,16 +78,23 @@ export function isCompactionTurn(messages: AiChatMessage[]): boolean {
       last.request.id.commandId === "compact";
 }
 
+/** A user or gadget message that prompted a turn, rather than one that steered a running turn. */
+export function isTurnPrompt(message: AiChatMessage): boolean {
+  return message.type === "message" && !message.steered &&
+      (message.author.type === "user" || message.author.type === "gadget");
+}
+
 /**
  * A message that begins an agent turn: the user or a gadget prompted, a callback or nudge arrived,
- * or an accepted connection resumed the agent. Each produces a `user` model message, so cutting
- * here keeps the retained messages from opening mid-turn.
+ * or an accepted connection or approved web fetch resumed the agent. Each produces a `user` model
+ * message, so cutting here keeps the retained messages from opening mid-turn.
  */
 export function startsAgentTurn(message: AiChatMessage): boolean {
   switch (message.type) {
-    case "message": return message.author.type === "user" || message.author.type === "gadget";
+    case "message": return isTurnPrompt(message);
     case "agentCallback": case "agentNudge": return true;
     case "connectionRequest": return message.state === "accepted";
+    case "webFetchRequest": return message.state === "approved";
     default: return false;
   }
 }
@@ -163,14 +173,15 @@ export function chatChangeStatuses(
 }
 
 /**
- * Earliest turn a checkpoint cannot absorb, or undefined if none. A pending connection request
- * carries live accept/deny state that only its own message can answer, so the boundary stays behind
- * it. Provisional gadget creations and binding additions need no such protection: the checkpoint
- * records them, and the registry rows they name are untouched by compaction.
+ * Earliest turn a checkpoint cannot absorb, or undefined if none. A pending connection or web fetch
+ * request carries live decision state that only its own message can answer, so the boundary stays
+ * behind it. Provisional gadget creations and binding additions need no such protection: the
+ * checkpoint records them, and the registry rows they name are untouched by compaction.
  */
 export function findProtectedFromSequence(messages: AiChatMessage[]): number | undefined {
-  let protectedIndex = messages.findIndex(
-      message => message.type === "connectionRequest" && message.state === "pending");
+  let protectedIndex = messages.findIndex(message =>
+      (message.type === "connectionRequest" || message.type === "webFetchRequest") &&
+      message.state === "pending");
   if (protectedIndex < 0) return undefined;
 
   // Protect from the start of the turn that raised it, so the tail keeps the exchange explaining
@@ -285,7 +296,7 @@ export function findCompactionBoundary(
   // messages; the weights affect only where the cut lands.
   let weights = projection.map(({message}) => projectionMessageWeight(message));
   let tokensPerWeight = contextTokens / weights.reduce((sum, weight) => sum + weight, 0);
-  let tailBudget = inputBudget * COMPACTION_TARGET_RATIO;
+  let tailBudget = Math.min(inputBudget * COMPACTION_TARGET_RATIO, COMPACTION_TAIL_TOKEN_LIMIT);
   let keptTokens = 0;
   let keepFrom = projection.length - 1;
   for (; keepFrom >= 0; --keepFrom) {

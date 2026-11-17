@@ -31,6 +31,11 @@ const testState = vi.hoisted(() => ({
     initialResourceUrl?: string,
     resourceUrlPattern?: string,
   }[],
+  // The mounted configurator frame and the access-request handler its host was given.
+  configurator: null as {
+    frame: ResourceConfiguratorFrame
+    ensureResources: ((patterns: string[]) => Promise<boolean>) | undefined
+  } | null,
 }))
 
 const openConnectWindow = vi.hoisted(() =>
@@ -62,6 +67,7 @@ vi.mock('./ResourceConfiguratorHost', async () => {
     resourceUrlPattern,
     onCollectResourceUrlChange,
     onSelectionReadyChange,
+    onEnsureResources,
   }: {
     frame: ResourceConfiguratorFrame | null
     loading: boolean
@@ -70,8 +76,12 @@ vi.mock('./ResourceConfiguratorHost', async () => {
     resourceUrlPattern?: string
     onCollectResourceUrlChange?: (collect: (() => Promise<string>) | null) => void
     onSelectionReadyChange?: (ready: boolean | null) => void
+    onEnsureResources?: (patterns: string[]) => Promise<boolean>
   }) => {
     const mounted = Boolean(frame && !loading && !disabled)
+    useEffect(() => {
+      testState.configurator = frame ? { frame, ensureResources: onEnsureResources } : null
+    }, [frame, onEnsureResources])
     useEffect(() => {
       if (!mounted) return
       testState.configuratorMounts.push({ initialResourceUrl, resourceUrlPattern })
@@ -272,7 +282,12 @@ function googleAccount(id: number, grantedResourceUrlPatterns: string[]): Accoun
   }
 }
 
-function gatekeeperApi(initialGrants: string[] | null, secondAccountGrants?: string[]) {
+function gatekeeperApi(
+  initialGrants: string[] | null,
+  secondAccountGrants?: string[],
+  resource = CALENDAR_RESOURCE,
+  grantedResourceTypeIds?: string[],
+) {
   let subscriber: ConnectedAccountsSubscriber | null = null
   const startResourceConfigurator = vi.fn<
     (accountId: number, resourceUrlPattern: string) => Promise<ResourceConfiguratorFrame>
@@ -294,15 +309,16 @@ function gatekeeperApi(initialGrants: string[] | null, secondAccountGrants?: str
     listGatekeeperVendors: async () => [{
       id: 'google',
       description: GOOGLE_VENDOR,
-      supportedResources: [CALENDAR_RESOURCE],
+      supportedResources: [resource],
     }],
     subscribeConnectedAccounts: (nextSubscriber: ConnectedAccountsSubscriber) => {
       subscriber = nextSubscriber
       if (initialGrants) {
-        subscriber.add(7, googleAccount(7, initialGrants), GOOGLE_VENDOR, [CALENDAR_RESOURCE], true, 'google')
+        subscriber.add(7, { ...googleAccount(7, initialGrants), grantedResourceTypeIds },
+          GOOGLE_VENDOR, [resource], true, 'google')
       }
       if (secondAccountGrants) {
-        subscriber.add(8, googleAccount(8, secondAccountGrants), GOOGLE_VENDOR, [CALENDAR_RESOURCE], true, 'google')
+        subscriber.add(8, googleAccount(8, secondAccountGrants), GOOGLE_VENDOR, [resource], true, 'google')
       }
       subscriber.ready()
       return subscription()
@@ -321,11 +337,11 @@ function gatekeeperApi(initialGrants: string[] | null, secondAccountGrants?: str
     reconnectAccount,
     updateGrants(grants: string[]) {
       if (!subscriber) throw new Error('account subscriber is not ready')
-      subscriber.add(7, googleAccount(7, grants), GOOGLE_VENDOR, [CALENDAR_RESOURCE], true, 'google')
+      subscriber.add(7, googleAccount(7, grants), GOOGLE_VENDOR, [resource], true, 'google')
     },
-    addAccount(id: number, grants: string[]) {
+    addAccount(id: number, grants: string[], supportedResources = [resource]) {
       if (!subscriber) throw new Error('account subscriber is not ready')
-      subscriber.add(id, googleAccount(id, grants), GOOGLE_VENDOR, [CALENDAR_RESOURCE], true, 'google')
+      subscriber.add(id, googleAccount(id, grants), GOOGLE_VENDOR, supportedResources, true, 'google')
     },
     removeAccount(id: number) {
       if (!subscriber) throw new Error('account subscriber is not ready')
@@ -373,6 +389,74 @@ describe('BlueprintLandingPage gatekeeper configuration', () => {
     await act(async () => findButton('Save connection')!.click())
     await vi.waitFor(() => expect(findButton('Create Gadget')).toBeDefined())
   }
+
+  it.each([
+    { grantedIds: ['calendar'], canConfigure: true },
+    { grantedIds: [], canConfigure: false },
+  ])('uses the saved type and authoritative ID grants after a pattern change: $grantedIds',
+    async ({ grantedIds, canConfigure }) => {
+      const harness = gatekeeperApi([CALENDAR_PATTERN], undefined, {
+        ...CALENDAR_RESOURCE, id: 'calendar',
+        urlPattern: 'https://calendar.google.com/calendar/:id/*',
+      }, grantedIds)
+      await render(harness, {
+        ...CALENDAR_BLUEPRINT,
+        metadata: {
+          ...CALENDAR_BLUEPRINT.metadata,
+          bindings: { CALENDAR: {
+            ...CALENDAR_BLUEPRINT.metadata.bindings.CALENDAR, resourceTypeId: 'calendar',
+          } },
+        },
+      })
+
+      await act(async () => findButton('Configure')!.click())
+      await vi.waitFor(() => expect(findButton('Save connection')!.disabled).toBe(!canConfigure))
+      expect(harness.startResourceConfigurator.mock.calls).toEqual(canConfigure ? [[7, 'calendar']] : [])
+      expect(Boolean(findButton('Grant access'))).toBe(!canConfigure)
+    })
+
+  it.each([{ grants: null }, { grants: [CALENDAR_PATTERN] }])(
+    'explains an unsupported creation-only blueprint binding with account grants $grants',
+    async ({ grants }) => {
+      const harness = gatekeeperApi(grants, undefined, {
+        ...CALENDAR_RESOURCE, connectable: false, creatable: true,
+      })
+      await render(harness)
+      await act(async () => findButton('Configure')!.click())
+
+      expect(document.body.textContent).toContain('does not support connecting an existing resource')
+      expect(findButton('Connect Google')).toBeUndefined()
+      expect(findButton('Save connection')!.disabled).toBe(true)
+      expect(harness.startResourceConfigurator).not.toHaveBeenCalled()
+    },
+  )
+
+  it('invalidates a saved connection when its account stops offering connections', async () => {
+    const harness = gatekeeperApi([CALENDAR_PATTERN])
+    await render(harness)
+    await saveCalendarConnection()
+    harness.startResourceConfigurator.mockClear()
+
+    await act(async () => harness.addAccount(7, [CALENDAR_PATTERN], [{
+      ...CALENDAR_RESOURCE, connectable: false, creatable: true,
+    }]))
+
+    expect(findButton('Configure 1 remaining connection')).toBeDefined()
+    await act(async () => findButton('Configure')!.click())
+    expect(document.body.textContent).toContain("Your connected Google account can't be used")
+    expect(findButton('Save connection')!.disabled).toBe(true)
+    expect(harness.startResourceConfigurator).not.toHaveBeenCalled()
+  })
+
+  it('configures an existing resource when its type also offers creation', async () => {
+    const harness = gatekeeperApi([CALENDAR_PATTERN], undefined, {
+      ...CALENDAR_RESOURCE, connectable: true, creatable: true,
+    })
+    await render(harness)
+    await saveCalendarConnection()
+
+    expect(harness.startResourceConfigurator).toHaveBeenCalledExactlyOnceWith(7, CALENDAR_PATTERN)
+  })
 
   it('shows the recommendation without prefilling it into the configurator', async () => {
     const harness = gatekeeperApi([CALENDAR_PATTERN])
@@ -497,6 +581,32 @@ describe('BlueprintLandingPage gatekeeper configuration', () => {
     expect(harness.connectAccount).toHaveBeenCalledExactlyOnceWith('google', [CALENDAR_PATTERN])
   })
 
+  it('explains why a newly connected account that cannot serve the binding is not listed', async () => {
+    // A gatekeeper may offer an account fewer resource types than its vendor, and the chooser lists
+    // only accounts offering the binding's type, so without a message the account the user just
+    // connected silently never appears.
+    const harness = gatekeeperApi(null)
+    await render(harness)
+    await act(async () => findButton('Configure')!.click())
+    await vi.waitFor(() => expect(findButton('Connect Google')).toBeDefined())
+
+    await act(async () => harness.addAccount(7, [GMAIL_PATTERN], [{
+      urlPattern: GMAIL_PATTERN,
+      title: 'Gmail',
+      description: 'Read and send mail.',
+      grantable: true,
+    }]))
+
+    expect(document.body.textContent).toContain("Your connected Google account can't be used for Google Calendar")
+    expect(harness.startResourceConfigurator).not.toHaveBeenCalled()
+
+    await act(async () => harness.addAccount(8, [CALENDAR_PATTERN]))
+
+    await vi.waitFor(() => expect(harness.startResourceConfigurator)
+      .toHaveBeenCalledExactlyOnceWith(8, CALENDAR_PATTERN))
+    expect(document.body.textContent).not.toContain("can't be used for Google Calendar")
+  })
+
   it('unblocks configuration when the server says the resource is already granted', async () => {
     const harness = gatekeeperApi([GMAIL_PATTERN])
     harness.ensureAccountResources.mockResolvedValueOnce(null)
@@ -586,5 +696,107 @@ describe('BlueprintLandingPage gatekeeper configuration', () => {
     })
 
     await act(async () => resolveGrant!(null))
+  })
+})
+
+// Switches the binding to the second account and waits for its configurator.
+const selectSecondAccount = async () => {
+  const account = Array.from(document.body.querySelectorAll('button'))
+    .find(button => button.textContent?.startsWith('account-2'))!
+  await act(async () => account.click())
+  await vi.waitFor(() => expect(testState.configurator?.frame.iframeHtml).toBe('frame-2'))
+  return testState.configurator!.ensureResources!
+}
+
+describe('BlueprintLandingPage configurator access requests', () => {
+  const RESOURCE = {
+    urlPattern: 'https://catalog.example.com/*',
+    title: 'Service catalog',
+    description: 'Example service catalog',
+  }
+  const IMPORT_GRANT = 'https://catalog.example.com/import'
+  const VENDOR = { displayName: 'Service catalog', url: 'https://catalog.example.com/' }
+  const GATEKEEPER_BLUEPRINT: BlueprintPublicInfo = {
+    ...BLUEPRINT,
+    metadata: {
+      ...BLUEPRINT.metadata,
+      bindings: {
+        CATALOG: {
+          type: 'gatekeeper',
+          title: 'Catalog',
+          description: '',
+          gatekeeperName: 'catalog',
+          typeUrlPattern: RESOURCE.urlPattern,
+        },
+      },
+    },
+  }
+
+  const startResourceConfigurator = vi.fn<(accountId: number, pattern: string) => Promise<object>>()
+  const ensureAccountResources =
+    vi.fn<(accountId: number, patterns: string[]) => Promise<ConnectFlowStart | null>>()
+
+  let root: Root | undefined
+  let rootContainer: HTMLDivElement | undefined
+
+  afterEach(() => {
+    act(() => root?.unmount())
+    rootContainer?.remove()
+    testState.authenticatedApi = null
+    testState.configurator = null
+    startResourceConfigurator.mockReset()
+    ensureAccountResources.mockReset()
+    openConnectWindow.mockClear()
+  })
+
+  // Opens the binding's configuration, which starts a configurator on the first account.
+  const openBinding = async () => {
+    startResourceConfigurator.mockImplementation(async accountId => ({
+      iframeHtml: `frame-${accountId}`,
+      ui: { [Symbol.dispose]() {} },
+    }))
+    testState.authenticatedApi = {
+      ...authenticatedApi(),
+      listGatekeeperVendors: async () => [{ id: 'catalog', description: VENDOR, supportedResources: [RESOURCE] }],
+      subscribeConnectedAccounts: (subscriber: ConnectedAccountsSubscriber) => {
+        for (const id of [1, 2]) {
+          subscriber.add(id, { uniqueName: `account-${id}`, avatar: { url: VENDOR.url } }, VENDOR, [RESOURCE], true, 'catalog')
+        }
+        subscriber.ready()
+        return subscription()
+      },
+      startResourceConfigurator,
+      ensureAccountResources,
+    } as unknown as RpcStub<AuthenticatedApi>
+    rootContainer = document.createElement('div')
+    document.body.appendChild(rootContainer)
+    root = createRoot(rootContainer)
+
+    await act(async () => root!.render(<BlueprintLandingPage rpcStub={publicApi(GATEKEEPER_BLUEPRINT)} />))
+    await act(async () => { await Promise.resolve() })
+    const configure = Array.from(document.body.querySelectorAll('button'))
+      .find(button => button.textContent === 'Configure')!
+    await act(async () => configure.click())
+    await vi.waitFor(() => expect(testState.configurator?.frame.iframeHtml).toBe('frame-1'))
+  }
+
+  it('resolves true without a pop-up when the account already holds the grants', async () => {
+    ensureAccountResources.mockResolvedValue(null)
+    await openBinding()
+
+    await expect(testState.configurator!.ensureResources!([IMPORT_GRANT])).resolves.toBe(true)
+
+    expect(ensureAccountResources).toHaveBeenCalledExactlyOnceWith(1, [IMPORT_GRANT])
+    expect(openConnectWindow).not.toHaveBeenCalled()
+  })
+
+  it('asks for the account the configurator was started on', async () => {
+    ensureAccountResources.mockResolvedValue(null)
+    await openBinding()
+    const ensureResources = await selectSecondAccount()
+
+    expect(startResourceConfigurator).toHaveBeenLastCalledWith(2, RESOURCE.urlPattern)
+    await ensureResources([IMPORT_GRANT])
+    expect(ensureAccountResources).toHaveBeenCalledExactlyOnceWith(2, [IMPORT_GRANT])
   })
 })
