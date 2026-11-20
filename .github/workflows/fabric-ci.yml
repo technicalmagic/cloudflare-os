@@ -5,11 +5,26 @@
 # runs on pushes to `main` and, since upstream added `pull_request:`, on pull requests too, so its
 # legs do run on a PR into `distro`; but it never runs on a push to `distro` or `upstream-main`, and
 # `distro`'s required checks are this file's jobs (suite, invariants), not upstream's.
+#
+# What runs when (Chris Beard, 2026-11-20, after Actions here were stopped for excess compute):
+#
+#   pull request into distro   suite and invariants: the required checks.
+#   push to distro             invariants only. The suite already ran on the pull request that put the
+#                              commit there, over the same tree, and running it again on the merge
+#                              bought a second 20-minute run per change for nothing a merge needed.
+#   by hand                    both, on whatever ref is chosen.
+#
+# `upstream-main` is not listed under `push`. It was, and never ran: a push runs the workflow file
+# of the commit pushed, and upstream-main is upstream's tree, which has no file by this name.
+#
+# A run started by hand does not satisfy `distro`'s required checks; only a pull request's own run
+# does. A pull request opened while Actions is off therefore has to be closed and reopened once
+# Actions is back, as #7 was.
 name: fabric-ci
 
 on:
   push:
-    branches: [distro, upstream-main]
+    branches: [distro]
   pull_request:
     branches: [distro]
   workflow_dispatch:
@@ -23,6 +38,8 @@ concurrency:
 
 jobs:
   suite:
+    # Not on a push to distro: see "What runs when" above.
+    if: github.event_name != 'push'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
