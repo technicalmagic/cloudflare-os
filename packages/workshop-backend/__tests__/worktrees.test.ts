@@ -96,7 +96,7 @@ function addChat(impl: any, id: number): void {
 
 async function commitFiles(
     impl: any, files: Record<string, string>, parents: string[] = []): Promise<string> {
-  return await impl.gitStore.writeFilesAsCommit(new Map(Object.entries(files)), {
+  return await impl.gitCache.writeFilesAsCommit(new Map(Object.entries(files)), {
     parents,
     author: { name: "Alice", email: "alice@example.com" },
     message: "test commit",
@@ -224,8 +224,6 @@ describe("createWorktree", () => {
       baseCommit: c1, headCommit: c1, pinBase: c1,
       pending: { chatId: 1 },
     });
-    // A purely local commit has no gatekeeper source.
-    expect(record.sourceGatekeeperId).toBeUndefined();
     expect(record.bindingName).toBeUndefined();
 
     // A second worktree at the same commit is fine: no workspace-level name is claimed.
@@ -252,15 +250,6 @@ describe("createWorktree", () => {
     impl.storage.gitObjectMetadata.put(
         { oid, type: "commit", onRemote: [99], pullableFrom: [], pendingPush: [] });
     await expect(impl.createWorktree("W", 1, oid)).rejects.toThrow(/[Rr]econnect/);
-  }));
-
-  it("records the first recorded source as sourceGatekeeperId", () => withImpl(async impl => {
-    addChat(impl, 1);
-    let c1 = await commitFiles(impl, { "a.txt": "one\n" });
-    impl.storage.gitObjectMetadata.put(
-        { oid: c1, type: "commit", onRemote: [42], pullableFrom: [], pendingPush: [] });
-    let created = await impl.createWorktree("W", 1, c1);
-    expect(impl.storage.gadgets.get(created.id)!.sourceGatekeeperId).toBe(42);
   }));
 });
 
@@ -856,11 +845,11 @@ describe("worktree commit head advancements", () => {
 
     // Two explicit commits within one step (as two commit() calls in one executeCode would
     // buffer them): the barrier validates the previousHead chain and applies both in order.
-    let c2 = await impl.gitStore.writeChangedFilesAsCommit(
+    let c2 = await impl.gitCache.writeChangedFilesAsCommit(
         new Map([["a.txt", "two\n"]]),
         { treeBase: c1, parents: [c1], author: { name: "A", email: "a@x" },
           message: "first", timestamp: new Date(1700000000_000) });
-    let c3 = await impl.gitStore.writeChangedFilesAsCommit(
+    let c3 = await impl.gitCache.writeChangedFilesAsCommit(
         new Map([["a.txt", "three\n"]]),
         { treeBase: c1, parents: [c2], author: { name: "A", email: "a@x" },
           message: "second", timestamp: new Date(1700000001_000) });
@@ -989,7 +978,7 @@ describe("epoch reset advances the accepted commit", () => {
     expect(await impl.readFileAtCommit(record.pinBase, "a.txt")).toBe("one!\n");
     expect(await impl.readFileAtCommit(record.pinBase, "new.txt")).toBe("fresh\n");
     expect(await impl.readFileAtCommit(record.pinBase, "src/b.txt")).toBeUndefined();
-    let [autoCommit] = await impl.gitStore.readCommitLog(record.pinBase, { depth: 1 });
+    let [autoCommit] = impl.gitCache.readCommitLog(record.pinBase, { depth: 1 });
     expect(autoCommit.parents).toEqual([c1]);
     expect(autoCommit.author.name).toBe(USER.name);
 
@@ -1063,7 +1052,7 @@ describe("epoch reset advances the accepted commit", () => {
     // commit() would): the accept's flatten equals the head's tree, so the accepted commit
     // becomes the head instead of a new auto-commit.
     await barrier(impl, 1, { changes: [{ change: editChange(id, "a.txt", "one\n", "one!\n") }]});
-    let c2 = await impl.gitStore.writeChangedFilesAsCommit(
+    let c2 = await impl.gitCache.writeChangedFilesAsCommit(
         new Map([["a.txt", "one!\n"]]),
         { treeBase: c1, parents: [c1], author: { name: "A", email: "a@x" },
           message: "explicit", timestamp: new Date(1700000002_000) });
@@ -1091,11 +1080,11 @@ describe("epoch reset advances the accepted commit", () => {
 
     // An explicit commit built the way commit() builds one -- tree from pinBase + (empty)
     // overlay, parent on the last explicit head -- skips both auto-commits in its ancestry.
-    let explicit = await impl.gitStore.writeChangedFilesAsCommit(
+    let explicit = await impl.gitCache.writeChangedFilesAsCommit(
         new Map(), { treeBase: record.pinBase, parents: [record.headCommit],
                      author: { name: "A", email: "a@x" }, message: "explicit",
                      timestamp: new Date(1700000003_000) });
-    let [info] = await impl.gitStore.readCommitLog(explicit, { depth: 1 });
+    let [info] = impl.gitCache.readCommitLog(explicit, { depth: 1 });
     expect(info.parents).toEqual([c1]);
     expect(await impl.readFileAtCommit(explicit, "a.txt")).toBe("three\n");
   }));
@@ -1211,5 +1200,48 @@ describe("logs from the born-pinned version", () => {
     expect(codeBaseOf(impl, 1).pins).toEqual([]);
     expect(await impl.readFileAtCommit(impl.storage.gadgets.get(id)!.pinBase, "a.txt"))
         .toBe("one?\n");
+  }));
+});
+
+// A spawned agent may modify only worktrees (see assertMayModifyWorkpiece in agent.ts), so its
+// chat holds no gadget changes, not even a user's: one filed there would be credited to the agent.
+describe("a spawned agent's chat", () => {
+  function addSpawnedChat(impl: any, id: number): void {
+    addChat(impl, id);
+    impl.storage.chatContext.put(
+        { chatId: id, spawnerConfig: { displayName: "Spawner", modelId: null, env: {} } });
+  }
+
+  it("takes a user's changes to its worktrees but not to a gadget", () => withImpl(async impl => {
+    addSpawnedChat(impl, 1);
+    let c1 = await commitFiles(impl, { "a.txt": "one\n" });
+    let { id, baseCommit } = await createThroughBarrier(impl, 1, c1);
+    let gadget = impl.createGadget("Gadget", "GADGET_X", undefined, undefined, c1);
+
+    expect(await submit(impl, 1, "cli-worktree", { [id]: [["notes.txt", { set: "live\n" }]] },
+                        [{ gadgetId: id, baseCommit }]))
+        .toEqual({ generation: 0, revision: 1 });
+    await expect(submit(impl, 1, "cli-gadget", { [gadget.id]: [["a.txt", { set: "two\n" }]] }))
+        .rejects.toThrow(/spawned agent's chat can't hold changes to a gadget/);
+    await expect(submit(impl, 1, "cli-both", {
+      [id]: [["notes.txt", { set: "again\n" }]],
+      [gadget.id]: [["a.txt", { set: "two\n" }]],
+    })).rejects.toThrow(/spawned agent's chat can't hold changes to a gadget/);
+    expect(codeBaseOf(impl, 1).pins.map(pin => pin.gadgetId)).toEqual([id]);
+  }));
+
+  it("refuses a client's gadget creation and provisional binding in it",
+      () => withClient(async (impl, client) => {
+    addSpawnedChat(impl, 1);
+    let c1 = await commitFiles(impl, { "a.txt": "one\n" });
+    let gadget = impl.createGadget("Gadget", "GADGET_X", undefined, undefined, c1);
+
+    await expect(client.createGadget("Draft", 1, "DRAFT"))
+        .rejects.toThrow(/spawned agent's chat can't hold changes to a gadget/);
+    using stub = await client.getGadget(gadget.id);
+    await expect(stub.bind("RES", 999, 1))
+        .rejects.toThrow(/spawned agent's chat can't hold changes to a gadget/);
+    expect(chatMessages(impl, 1).filter(msg => msg.type === "changes")).toEqual([]);
+    expect([...impl.storage.gadgets.list()].map((g: { id: number }) => g.id)).toEqual([gadget.id]);
   }));
 });

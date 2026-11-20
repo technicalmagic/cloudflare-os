@@ -2,7 +2,7 @@ import { readFileSync } from 'node:fs'
 import path from 'node:path'
 import type { Plugin } from 'vite'
 import { defineConfig } from 'vitest/config'
-import { cloudflareTest } from '@cloudflare/vitest-pool-workers'
+import { cloudflareTest } from '@cloudflare/vitest-plugin'
 import { COMPATIBILITY_DATE } from '@gadgets/scripts/worker-config'
 import capnwebValidate from 'capnweb-validate/vite'
 
@@ -60,7 +60,7 @@ export default {
 `
 
 /**
- * Tests run inside workerd (via vitest-pool-workers) so they exercise the same runtime APIs as
+ * Tests run inside workerd (via `@cloudflare/vitest-plugin`) so they exercise the same runtime APIs as
  * production -- e.g. Uint8Array.toHex/fromHex and crypto.subtle used by the sharing module. Most
  * tests import modules directly; the main Worker and a test-only SQLite DO binding support the
  * Overseer cost-persistence integration test without loading the full deployment configuration.
@@ -85,7 +85,12 @@ export default defineConfig({
           compatibilityDate: COMPATIBILITY_DATE,
           compatibilityFlags: ['experimental', 'streaming_tail_worker'],
         }],
-        bindings: { PUBLIC_BASE_URL: 'https://workshop.example/' },
+        // FAST_CHECK_SEED reaches the property suites' `process.env` (see
+        // @gadgets/scripts/property-runs) through `nodejs_compat`, which copies string bindings there.
+        bindings: {
+          PUBLIC_BASE_URL: 'https://workshop.example/',
+          ...process.env.FAST_CHECK_SEED ? { FAST_CHECK_SEED: process.env.FAST_CHECK_SEED } : {},
+        },
         // The overseer loads gadget code through this, so a test can run a real gadget facet.
         workerLoaders: { LOADER: {} },
         // Where a blueprint's content is published to and read back from.
@@ -97,9 +102,12 @@ export default defineConfig({
           // Never addressed by name: a binding is what puts the class in `ctx.exports`, from
           // which the overseer instantiates it (with props) as one of its own facets.
           TEST_AGENT_SPAWNER: { className: 'AgentSpawnerGatekeeper', useSQLite: true },
+          TEST_REPLICA_GIT_SOURCE: { className: 'ReplicaGitSource', useSQLite: true },
           TEST_USER_DIRECTORY: { className: 'UserDirectoryDurableObject', useSQLite: true },
           // Likewise only reached through `ctx.exports`, by the overseer deleting a blueprint.
           TEST_ADMIN_SETTINGS: { className: 'AdminSettings', useSQLite: true },
+          // AdminSettings also reaches it through `ctx.exports`.
+          TEST_ADMIN_AUDIT: { className: 'AdminAuditDurableObject', useSQLite: true },
           TEST_GATEKEEPER_USER_PICKER: { className: 'GatekeeperUserPickerTestHooks', useSQLite: true },
         },
       },
@@ -107,6 +115,11 @@ export default defineConfig({
   ],
   test: {
     include: ['__tests__/*.test.ts'],
+    // Vitest 5 enables this by default, and every run after the first breaks under the Workers
+    // pool: cached `.txt` modules come back with root-relative ids that `textModules` cannot
+    // read, and the pool's WebSocket rejects the larger cached modules (1009, "Message is too
+    // large"). Vite+ already caches the whole test task.
+    fsModuleCache: false,
     // Asserts the pool actually started, rather than trusting a green run to mean workerd.
     setupFiles: ['@gadgets/scripts/assert-workerd'],
   },
