@@ -1,18 +1,35 @@
 # Downstream CI for the fabric distro.
 #
 # A NEW filename on purpose: upstream's nine workflow files stay byte-identical so they never
-# conflict on a merge, and upstream will never create a file by this name. Upstream's own ci.yml
-# runs on pushes to `main` and, since upstream added `pull_request:`, on pull requests too, so its
-# legs do run on a PR into `distro`; but it never runs on a push to `distro` or `upstream-main`, and
-# `distro`'s required checks are this file's jobs (suite, invariants), not upstream's.
+# conflict on a merge, and upstream will never create a file by this name.
 #
-# What runs when (Chris Beard, 2026-11-20, after Actions here were stopped for excess compute):
+# `distro`'s required checks are three, and only one of them is this file's:
 #
-#   pull request into distro   suite and invariants: the required checks.
-#   push to distro             invariants only. The suite already ran on the pull request that put the
-#                              commit there, over the same tree, and running it again on the merge
-#                              bought a second 20-minute run per change for nothing a merge needed.
-#   by hand                    both, on whatever ref is chosen.
+#   Build and test   upstream's own ci.yml: every test leg of its suite. It runs on any pull request,
+#                    so it runs on one into `distro`, as upstream runs it and keeps it.
+#   Lint             the same workflow: lint, the type check of scripts/, the generated configs and
+#                    the build, which is the repository's one type check.
+#   invariants       this file: the patch ledger and the fork's other gates.
+#
+# This file used to run upstream's suite itself, as a job named `suite`: a build and every package's
+# tests on one runner. Chris Beard dropped it on 2026-11-20 ("go with option 1"), after Actions here
+# were stopped for excess compute and the job then failed twice on a pull request that changed no
+# code (#8): once on a browser test that timed out on the crowded runner, once on its own 20-minute
+# limit. Over the same tree upstream's four legs passed in five minutes and about 17 runner-minutes.
+# It was the same tests run a second time, slower and less reliably.
+#
+# What that leans on: upstream's ci.yml keeps running on pull requests and keeps the job names
+# `Build and test` and `Lint` (its own ruleset requires the first by name). If either changes, a pull
+# request into `distro` waits on a check that never reports. The fix then is to change the required
+# checks, or to bring a suite job back here; it is never to turn the requirement off.
+# So upstream's `CI` workflow must stay enabled in this repository's Actions settings. Its bots
+# (Bonk, CLA Assistant, Contribution policy, Label PR) do nothing here and can be disabled.
+#
+# What runs when:
+#
+#   pull request into distro   invariants (and, from ci.yml, Build and test and Lint).
+#   push to distro             invariants. ci.yml runs on a push to `main` only.
+#   by hand                    invariants, on whatever ref is chosen.
 #
 # `upstream-main` is not listed under `push`. It was, and never ran: a push runs the workflow file
 # of the commit pushed, and upstream-main is upstream's tree, which has no file by this name.
@@ -37,45 +54,6 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  suite:
-    # Not on a push to distro: see "What runs when" above.
-    if: github.event_name != 'push'
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@v5
-        with:
-          fetch-depth: 0
-
-      # Pinned, not ">=". The version lives only in upstream's ci.yml NODE_VERSION -- package.json
-      # declares no engines -- and Node 26 fails 22 frontend tests because jsdom's localStorage is
-      # absent. Read it from upstream's own workflow so a bump there reaches us.
-      - name: Resolve upstream's pinned Node version
-        id: node
-        run: |
-          version="$(grep -E '^\s*NODE_VERSION:' .github/workflows/ci.yml \
-            | head -1 | sed -E 's/.*"([^"]+)".*/\1/')"
-          test -n "$version" || { echo "NODE_VERSION not found in ci.yml"; exit 1; }
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "Using Node $version"
-
-      - uses: actions/setup-node@v6
-        with:
-          node-version: ${{ steps.node.outputs.version }}
-
-      - run: corepack enable
-      - run: pnpm install --frozen-lockfile
-
-      # Upstream's workshop-frontend browser suite (vitest.browser.config.ts, since upstream
-      # e87f72f5, #717) runs in headless Chromium, which Playwright downloads outside node_modules,
-      # so `pnpm test` fails at browserType.launch without it. The same step as upstream's ci.yml.
-      - name: Install Chromium for the browser suite
-        run: pnpm --filter @gadgets/workshop-frontend exec playwright install --with-deps chromium
-
-      # Gate A: upstream's own suite, unmodified.
-      - run: pnpm run build
-      - run: pnpm test
-
   invariants:
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -95,7 +73,7 @@ jobs:
       # patch's own PATCHES.md entry names it on its **High-churn:** line.
       #
       # The ledger script is TypeScript run directly by node, which needs native type stripping --
-      # so pin the same Node the suite uses rather than inherit the runner's default.
+      # so pin the Node upstream's own workflow names rather than inherit the runner's default.
       - name: Resolve upstream's pinned Node version
         id: node
         run: |
