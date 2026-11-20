@@ -157,12 +157,10 @@ names the caller either. So a search reaches `env.AI.websearch()` with a gateway
 and a limit, and nothing downstream of the kernel, Fabric's AI proxy included, can learn whose account
 it came from. A wrapper around the binding cannot add what the gatekeeper was never told.
 
-**Why it was needed:** Chris decided at 2026-10-20 00:14Z, answering "Who pays for a search" on
-technicalmagic/fabric PR 371: "who pays? all tools and models should use and charge energy to the
-owner (currently) and possibly in future if elected for the end-user". For Web Search that is the
-PR's option (a): the workspace owner pays, through a kernel patch. A workspace's ambient Web Search is
-its owner's auto-provisioned account (`ensureAmbientCapsules` in `overseer.ts`), so naming the account's
-owner at mint names the workspace owner on every search, whoever in the workspace runs it.
+**Why it was needed:** a search has to be attributable to the workspace's owner. A workspace's
+ambient Web Search is its owner's auto-provisioned account (`ensureAmbientCapsules` in `overseer.ts`),
+so naming the account's owner at mint names the workspace owner on every search, whoever in the
+workspace runs it.
 
 **Shape:**
 

@@ -23,8 +23,8 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
 /**
- * Upstream refuses contributions, so every patch is permanent. PATCHES.md sets the budget -- ten since
- * Chris raised it on 2026-09-17 -- and explains why the count is the cheap half of the rule. This
+ * Upstream refuses contributions, so every patch is permanent. PATCHES.md sets the budget -- ten
+ * since 2026-09-17 -- and explains why the count is the cheap half of the rule. This
  * number must match it. A RETIRED entry no longer counts.
  */
 export const MAX_PATCHES = 10;

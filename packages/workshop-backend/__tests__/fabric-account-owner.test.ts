@@ -1,7 +1,7 @@
 // DOWNSTREAM (fabric): the Workshop names an auto-provisioned account's owner. Covers PATCH-ID
 // fabric-account-owner.
 //
-// Chris decided on 2026-10-20 that a tool's use is charged to the workspace owner. Upstream mints an
+// A tool's use is attributed to the workspace owner. Upstream mints an
 // auto-provisioned account with GatekeeperVendor.createAccount() and no arguments, so a vendor can
 // never learn whose account it minted, and nothing it sends can name who should pay. The patch passes
 // {principal} -- the identity string the user's Durable Object is named by -- on both minting paths,
