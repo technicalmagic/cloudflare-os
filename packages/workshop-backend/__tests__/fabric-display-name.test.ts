@@ -40,13 +40,13 @@ async function profileAfterLogin(
 
 describe("gatekeeper-supplied display name", () => {
   it("uses the name the gatekeeper supplied", async () => {
-    const profile = await profileAfterLogin("supplied", PRINCIPAL, "Chris Beard");
-    expect(profile?.name).toBe("Chris Beard");
+    const profile = await profileAfterLogin("supplied", PRINCIPAL, "Ada Lovelace");
+    expect(profile?.name).toBe("Ada Lovelace");
   });
 
   it("keys the account on the principal regardless of the display name", async () => {
     // The display name is cosmetic; the identity must remain the opaque principal.
-    const profile = await profileAfterLogin("keyed", PRINCIPAL, "Chris Beard");
+    const profile = await profileAfterLogin("keyed", PRINCIPAL, "Ada Lovelace");
     expect(profile?.id).toBe(PRINCIPAL);
   });
 
@@ -64,7 +64,7 @@ describe("gatekeeper-supplied display name", () => {
 
   it("does not leave an opaque principal as the display name", async () => {
     // The regression this patch exists to prevent, stated as its own assertion.
-    const profile = await profileAfterLogin("regression", PRINCIPAL, "Chris Beard");
+    const profile = await profileAfterLogin("regression", PRINCIPAL, "Ada Lovelace");
     expect(profile?.name).not.toBe(PRINCIPAL);
     expect(profile?.name).not.toMatch(/^user_[0-9A-Z]{20,}$/);
   });

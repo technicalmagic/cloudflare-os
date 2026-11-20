@@ -1,8 +1,8 @@
 // DOWNSTREAM (fabric): a Web Search account's owner reaches its searches. Covers PATCH-ID
 // fabric-account-owner.
 //
-// Chris decided on 2026-10-20 that a tool's use is charged to the workspace owner. The Workshop names
-// the owner when it mints the account; these tests follow that principal from createAccount through
+// A tool's use is attributed to the workspace owner. The Workshop names the owner when it mints the
+// account; these tests follow that principal from createAccount through
 // the account's props and the gatekeeper class's props to the env.AI.websearch() request, and check
 // that an account with no owner sends exactly upstream's request.
 //
